@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+<title>mHC: Manifold-Constrained Hyper-Connections 论文详解</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- ==================== Header ==================== -->
+<header>
+  <div class="page">
+    <span class="badge">DeepSeek · 2025.12</span>
+    <h1>mHC: Manifold-Constrained Hyper-Connections</h1>
+    <p class="subtitle">流形约束超连接 — 让残差流既"宽"又"稳"</p>
+    <p class="meta">
+      arXiv: <a href="https://arxiv.org/abs/2512.24880" target="_blank">2512.24880v2</a> ·
+      作者: Zhenda Xie, Yixuan Wei 等 (DeepSeek) ·
+      2025-12-31 · cs.CL / cs.AI / cs.LG
+    </p>
+  </div>
+</header>
+
+<!-- ==================== Sticky TOC ==================== -->
+<nav class="toc">
+  <div class="toc-inner">
+    <a href="#ch0">为什么</a>
+    <a href="#ch1">背景</a>
+    <a href="#ch2">HC原理</a>
+    <a href="#ch3">两大病灶</a>
+    <a href="#ch4">mHC思想</a>
+    <a href="#ch5">Birkhoff</a>
+    <a href="#ch6">Sinkhorn</a>
+    <a href="#ch7">基础设施</a>
+    <a href="#ch8">实验</a>
+    <a href="#ch9">总结</a>
+  </div>
+</nav>
+
+<main class="page">
+
+<!-- ==================== 第0章: 为什么 ==================== -->
+<section class="chapter" id="ch0">
+  <h2 class="chapter-title"><span class="num">0</span>一句话: 为什么需要 mHC?</h2>
+
+  <div class="callout why">
+    <div class="callout-title">💡 核心矛盾</div>
+    <p><strong>Hyper-Connections (HC)</strong> 把残差流从 1 条拓宽到 <code>n</code> 条 (如 n=4), 让信息在不同深度的特征之间自由混合, 确实带来了性能提升。但 <strong>拓宽 + 自由混合 = 信号不守恒</strong> — 跨层复合映射的增益可以爆炸到 <strong>≈3000</strong>, 导致大模型训练时 loss 突然飙升、梯度发散。HC 用空间换性能, 却丢掉了 ResNet 十年来的立身之本: <strong>恒等映射 (identity mapping)</strong>。</p>
+  </div>
+
+  <div class="callout insight">
+    <div class="callout-title">🎯 mHC 的解法</div>
+    <p>把 HC 里那个自由学习的残差映射矩阵 <code>H<sup>res</sup></code>, 通过 <strong>Sinkhorn-Knopp 算法</strong>投影到 <strong>双随机矩阵流形 (Birkhoff 多面体)</strong>上 — 强制每一行、每一列的和都等于 1。这样信号在流间混合时, <strong>总能量守恒</strong>, 复合映射的增益被严格限制在 ≤1.6 (比 HC 的 3000 低三个数量级), 同时保留了多流混合的表达力。</p>
+  </div>
+
+  <div class="anim-container" id="anim1">
+    <div class="anim-header">
+      <span>📊 三种残差连接范式对比</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="compare">范式对比</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">ResNet: 严格恒等 → 稳定但无流间混合 | HC: 无约束 H<sup>res</sup> → 混合但信号发散 | mHC: 双随机约束 → 既混合又守恒</div>
+  </div>
+</section>
+
+<!-- ==================== 第1章: 背景 ==================== -->
+<section class="chapter" id="ch1">
+  <h2 class="chapter-title"><span class="num">1</span>背景: 残差连接的十年</h2>
+
+  <h3 class="sub-title">1.1 ResNet 奠基: 恒等映射的威力</h3>
+  <p>2016 年 ResNet 确立了残差连接范式。单层传播为:</p>
+  <div class="eq-block">
+    <div class="eq-label">公式 (1) — 标准残差连接</div>
+    <div class="eq-math">x<sub>l+1</sub> = x<sub>l</sub> + 𝓕(x<sub>l</sub>, 𝒲<sub>l</sub>)</div>
+  </div>
+  <p>其中 <code>x<sub>l</sub></code> 是 C 维输入, <code>𝓕</code> 是残差函数 (Attention、FFN 等)。这个形式之所以稳定, 是因为 <strong>恒等映射</strong>: 信号从浅层 <code>l</code> 直接传到深层 <code>L</code> 不被修改。递推展开:</p>
+  <div class="eq-block">
+    <div class="eq-label">公式 (2) — 多层递推 (恒等映射可见)</div>
+    <div class="eq-math">x<sub>L</sub> = x<sub>l</sub> + Σ<sub>i=l</sub><sup>L-1</sup> 𝓕(x<sub>i</sub>, 𝒲<sub>i</sub>)</div>
+  </div>
+  <p>注意等号右边的 <code>x<sub>l</sub></code> 项: 它<strong>原封不动</strong>地从第 l 层出现在第 L 层。这就是"identity mapping"——浅层信号无衰减地直达任意深层。这条性质是 ResNet 能训练上百层网络的根本原因。</p>
+
+  <h3 class="sub-title">1.2 宏观设计的演进</h3>
+  <p>过去十年, <strong>微观设计</strong> (块内部: 卷积→Attention+FFN, MQA/GQA/MLA, MoE) 进步巨大, 但<strong>宏观设计</strong> (块间拓扑) 长期停滞在标准残差。近期出现一批工作试图拓宽残差流:</p>
+  <div class="compare-grid">
+    <div class="compare-card baseline">
+      <h4>传统残差</h4>
+      <ul>
+        <li>单流 (1×C)</li>
+        <li>严格恒等映射</li>
+        <li>稳定, 可训练性极强</li>
+        <li>流间无信息交换</li>
+      </ul>
+    </div>
+    <div class="compare-card hc">
+      <h4>HC / DenseFormer / MUDDFormer</h4>
+      <ul>
+        <li>多流 (n×C)</li>
+        <li>可学习连接矩阵</li>
+        <li>跨层跨流信息融合</li>
+        <li><strong>破坏恒等映射</strong></li>
+      </ul>
+    </div>
+    <div class="compare-card mhc">
+      <h4>mHC (本文)</h4>
+      <ul>
+        <li>多流 (n×C)</li>
+        <li>双随机约束矩阵</li>
+        <li>跨层跨流信息融合</li>
+        <li><strong>恢复恒等映射</strong></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 第2章: HC 原理 ==================== -->
+<section class="chapter" id="ch2">
+  <h2 class="chapter-title"><span class="num">2</span>HC 的工作原理: 拓宽残差流</h2>
+
+  <p>Hyper-Connections (Zhu et al. 2024) 把残差流从 <code>C</code> 维扩展到 <code>n×C</code> 维 (n 为扩展率, 典型值 4)。它引入三个可学习映射:</p>
+
+  <div class="callout note">
+    <div class="callout-title">📐 HC 的三个映射</div>
+    <ul>
+      <li><strong>H<sup>pre</sup><sub>l</sub> ∈ ℝ<sup>1×n</sup></strong>: 从 nC 维流中"读出" C 维送入层函数 𝓕</li>
+      <li><strong>H<sup>post</sup><sub>l</sub> ∈ ℝ<sup>1×n</sup></strong>: 把 𝓕 的输出"写回" nC 维流</li>
+      <li><strong>H<sup>res</sup><sub>l</sub> ∈ ℝ<sup>n×n</sup></strong>: 在残差流内部<strong>混合</strong> n 条流 (最关键!)</li>
+    </ul>
+  </div>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (3) — HC 单层传播</div>
+    <div class="eq-math">x<sub>l+1</sub> = H<sup>res</sup><sub>l</sub>·x<sub>l</sub> + H<sup>post⊤</sup><sub>l</sub>·𝓕(H<sup>pre</sup><sub>l</sub>·x<sub>l</sub>, 𝒲<sub>l</sub>)</div>
+  </div>
+
+  <p>这三个映射由<strong>动态</strong> (输入相关的, 经 RMSNorm + tanh 线性投影) 和<strong>静态</strong> (可学习偏置) 两部分组成:</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (5) — HC 映射系数计算 (原始版本)</div>
+    <div class="eq-math">
+      x̃<sub>l</sub> = RMSNorm(x<sub>l</sub>)<br>
+      H<sup>pre</sup><sub>l</sub> = α<sup>pre</sup><sub>l</sub>·tanh(θ<sup>pre</sup><sub>l</sub>·x̃<sup>⊤</sup><sub>l</sub>) + b<sup>pre</sup><sub>l</sub><br>
+      H<sup>post</sup><sub>l</sub> = α<sup>post</sup><sub>l</sub>·tanh(θ<sup>post</sup><sub>l</sub>·x̃<sup>⊤</sup><sub>l</sub>) + b<sup>post</sup><sub>l</sub><br>
+      H<sup>res</sup><sub>l</sub> = α<sup>res</sup><sub>l</sub>·tanh(θ<sup>res</sup><sub>l</sub>·x̃<sup>⊤</sup><sub>l</sub>) + b<sup>res</sup><sub>l</sub>
+    </div>
+  </div>
+
+  <div class="callout insight">
+    <div class="callout-title">🧠 关键洞察: H<sup>res</sup> 才是性能发动机</div>
+    <p>论文 Table 1 的消融实验表明: 禁用 H<sup>pre</sup> 或 H<sup>post</sup> 性能损失不大, 但<strong>禁用 H<sup>res</sup> 性能下降最显著</strong>。这说明 HC 的收益主要来自残差流内部的<strong>跨流信息交换</strong>, 而非单纯的维度扩展。但正是这个 H<sup>res</sup>, 也成了不稳定的根源。</p>
+  </div>
+</section>
+
+<!-- ==================== 第3章: HC 的两大病灶 ==================== -->
+<section class="chapter" id="ch3">
+  <h2 class="chapter-title"><span class="num">3</span>HC 的两大病灶</h2>
+
+  <h3 class="sub-title">3.1 病灶一: 数值不稳定 — 复合映射爆炸</h3>
+
+  <p>把 HC 的单层公式 (3) 跨多层递推, 从层 l 到层 L:</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (4) — HC 多层复合映射 (问题所在!)</div>
+    <div class="eq-math">
+      x<sub>L</sub> = (∏<sub>i=1</sub><sup>L-l</sup> H<sup>res</sup><sub>L-i</sub>)·x<sub>l</sub>
+      + Σ<sub>i=l</sub><sup>L-1</sup> (∏<sub>j=1</sub><sup>L-1-i</sup> H<sup>res</sup><sub>L-j</sub>)·H<sup>post⊤</sup><sub>i</sub>·𝓕(...)
+    </div>
+  </div>
+
+  <div class="callout danger">
+    <div class="callout-title">⚠️ 问题核心</div>
+    <p>对比 ResNet 的公式 (2), 那里 <code>x<sub>l</sub></code> 前的系数是 1 (恒等)。而 HC 这里, <code>x<sub>l</sub></code> 前的系数变成了<strong>矩阵乘积</strong> <code>∏ H<sup>res</sup></code>。由于 H<sup>res</sup> 是<strong>无约束</strong>的可学习矩阵, 这个乘积的谱范数完全不可控 —— 信号会指数级放大或衰减。</p>
+  </div>
+
+  <p>论文用 <strong>Amax Gain Magnitude</strong> (复合映射行/列和绝对值的最大值) 量化这个问题。实测在 27B 模型中:</p>
+
+  <div class="anim-container" id="anim2">
+    <div class="anim-header">
+      <span>📈 HC vs mHC 信号传播对比</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="instability">不稳定性</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">左: HC 复合映射 ∏H<sup>res</sup> 增益指数爆炸 (峰值≈3000) | 右: mHC 复合映射有界 (峰值≈1.6)</div>
+  </div>
+
+  <p>实测现象: HC 在 27B 训练到约 12k 步时<strong>loss 突然飙升</strong>, 与梯度范数异常高度相关 (论文 Figure 2)。复合映射的 Amax Gain 峰值达到 <strong>3000</strong> — 远离理想值 1 整整三个数量级, 确认残差流发生了爆炸。</p>
+
+  <div class="anim-container" id="anim6">
+    <div class="anim-header">
+      <span>📉 复合映射增益 vs 层深度 (对数尺度)</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="gain">增益对比</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">HC (橙): 随层深度指数增长至 ≈3000 | mHC (蓝): 始终有界, 峰值仅 ≈1.6, 降低三个数量级</div>
+  </div>
+
+  <h3 class="sub-title">3.2 病灶二: 系统开销 — 内存墙与通信膨胀</h3>
+
+  <div class="callout warn">
+    <div class="callout-title">🧱 内存墙 (Memory Wall)</div>
+    <p>HC 的 FLOPs 几乎不增加 (映射矩阵很小), 但<strong>内存访问 (I/O) 成本按 n 倍增长</strong>。在现代架构中, I/O 往往是真正瓶颈 ("memory wall"), 而非计算。论文 Table 2 分析: 单层残差维护的 per-token 内存访问, HC 约为标准残差的 n 倍。</p>
+  </div>
+
+  <p>具体来说, HC 带来三重系统负担:</p>
+  <ol style="padding-left: 20px; margin-bottom: 14px;">
+    <li><strong>前向 I/O 膨胀</strong>: n 条流都要读写, 内存访问量 ∝ n</li>
+    <li><strong>反向显存膨胀</strong>: H<sup>pre</sup>、H<sup>post</sup>、H<sup>res</sup> 的中间激活都需保存用于反向, 显存占用大增, 常需梯度检查点</li>
+    <li><strong>流水线通信膨胀</strong>: 流水线并行 (PP) 中, 激活在 stage 间传递, n 条流意味着 n 倍通信量, 气泡变大, 吞吐下降</li>
+  </ol>
+</section>
+
+<!-- ==================== 第4章: mHC 核心思想 ==================== -->
+<section class="chapter" id="ch4">
+  <h2 class="chapter-title"><span class="num">4</span>mHC 核心思想: 流形投影恢复恒等映射</h2>
+
+  <div class="callout why">
+    <div class="callout-title">💡 设计哲学</div>
+    <p>ResNet 的恒等映射要求 <code>H<sup>res</sup> = I</code> (单位矩阵) — 稳定但<strong>完全禁止流间混合</strong>, 浪费了多流架构的潜力。mHC 的洞见: 我们不需要 H<sup>res</sup> 恒等于 I, 只需要它<strong>落在某个保证信号守恒的流形上</strong>。这样既能混合 (表达力), 又能守恒 (稳定性)。</p>
+  </div>
+
+  <p>mHC 选择的流形是 <strong>双随机矩阵集合</strong> (又称 Birkhoff 多面体)。形式化定义:</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (6) — Birkhoff 多面体 (双随机矩阵流形)</div>
+    <div class="eq-math">
+      𝒫<sub>𝓜<sup>res</sup></>(H<sup>res</sup><sub>l</sub>) := { H<sup>res</sup><sub>l</sub> ∈ ℝ<sup>n×n</sup> | H<sup>res</sup><sub>l</sub>·𝟏<sub>n</sub> = 𝟏<sub>n</sub>, 𝟏<sup>⊤</sup><sub>n</sub>·H<sup>res</sup><sub>l</sub> = 𝟏<sup>⊤</sup><sub>n</sub>, H<sup>res</sup><sub>l</sub> ≥ 0 }
+    </div>
+  </div>
+
+  <p>即: 矩阵所有元素非负, 且每一行、每一列的和都等于 1。当 <code>n=1</code> 时退化为标量 1, 正好恢复原始恒等映射。</p>
+
+  <div class="anim-container" id="anim3">
+    <div class="anim-header">
+      <span>🔷 Birkhoff 多面体: 双随机矩阵的几何意义</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="birkhoff">流形投影</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">无约束的 H<sup>res</sup> (橙点) 从全空间被投影到 Birkhoff 多面体 (绿域), 成为双随机矩阵 P<sub>𝓜</sub>(H<sup>res</sup>)</div>
+  </div>
+
+  <h3 class="sub-title">4.1 为什么双随机矩阵能解决一切?</h3>
+
+  <p>双随机约束带来 <strong>四个</strong>关键性质, 恰好对应 HC 的所有病灶:</p>
+
+  <h4 class="mini-title">① 范数保持 (Norm Preservation)</h4>
+  <p>双随机矩阵的<strong>谱范数 ≤ 1</strong> (即 <code>‖H<sup>res</sup><sub>l</sub>‖<sub>2</sub> ≤ 1</code>)。这意味着每一层的映射是<strong>非膨胀的 (non-expansive)</strong> — 信号通过它不会被放大。这从根本上消除了梯度爆炸的风险。</p>
+
+  <h4 class="mini-title">② 组合闭合 (Compositional Closure)</h4>
+  <p>双随机矩阵集合在矩阵乘法下<strong>封闭</strong>: 两个双随机矩阵相乘, 结果仍是双随机矩阵。因此跨多层复合 <code>∏ H<sup>res</sup><sub>L-i</sub></code> 仍然是双随机的, 谱范数仍 ≤ 1。<strong>整条残差路径从头到尾都守恒</strong>, 不论模型多深。</p>
+
+  <div class="callout insight">
+    <div class="callout-title">⚡ 这是 mHC 最漂亮的一点</div>
+    <p>ResNet 的恒等映射 <code>I</code> 也是一种"守恒", 但它是<strong>平凡的守恒</strong> (不混合)。双随机矩阵提供了<strong>非平凡的守恒</strong>: 信号在 n 条流之间重新分配 (像概率重分布), 但总量不变。这正好兼顾了"混合"和"守恒"两个看似矛盾的目标。</p>
+  </div>
+
+  <h4 class="mini-title">③ 几何意义: 排列矩阵的凸组合</h4>
+  <p>Birkhoff 多面体是<strong>所有排列矩阵的凸包</strong>。也就是说, 任何双随机矩阵都可以写成若干排列矩阵 <code>P<sub>k</sub></code> 的加权平均: <code>H<sup>res</sup> = Σ λ<sub>k</sub>·P<sub>k</sub></code> (λ<sub>k</sub> ≥ 0, Σλ = 1)。操作 <code>H<sup>res</sup>·x</code> 相当于对输入做若干种"打乱"再加权融合 — 一种天然的<strong>特征融合机制</strong>。而且反复施加这类矩阵会让信息在流间趋于均匀混合。</p>
+
+  <h4 class="mini-title">④ 信号均值守恒</h4>
+  <p>由于行和为 1, <code>H<sup>res</sup>·x</code> 的每个输出是输入的凸组合, <strong>输出均值 = 输入均值</strong>。流间信号强度的平均值在每层保持不变, 从根本上杜绝了某条流爆炸而其他流枯竭的不均衡现象。</p>
+
+  <h3 class="sub-title">4.2 参数化与流形投影</h3>
+
+  <p>mHC 的实际计算流程: 先用 HC 的方式生成"自由"的映射系数, 再用约束算子把它们投影到目标流形。</p>
+
+  <p><strong>第一步</strong>: 展平输入, 经 RMSNorm + 线性投影得到自由的 <code>H̃<sup>pre</sup></code>, <code>H̃<sup>post</sup></code>, <code>H̃<sup>res</sup></code> (与公式 5 类似但用展平输入):</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (7) — 自由映射系数</div>
+    <div class="eq-math">
+      x⃗'<sub>l</sub> = RMSNorm(x⃗<sub>l</sub>)<br>
+      H̃<sup>pre</sup><sub>l</sub> = α<sup>pre</sup><sub>l</sub>·(x⃗'<sub>l</sub>·φ<sup>pre</sup><sub>l</sub>) + b<sup>pre</sup><sub>l</sub><br>
+      H̃<sup>post</sup><sub>l</sub> = α<sup>post</sup><sub>l</sub>·(x⃗'<sub>l</sub>·φ<sup>post</sup><sub>l</sub>) + b<sup>post</sup><sub>l</sub><br>
+      H̃<sup>res</sup><sub>l</sub> = α<sup>res</sup><sub>l</sub>·mat(x⃗'<sub>l</sub>·φ<sup>res</sup><sub>l</sub>) + b<sup>res</sup><sub>l</sub>
+    </div>
+  </div>
+
+  <p><strong>第二步</strong>: 对自由系数施加约束算子, 得到最终的映射:</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (8) — 流形投影后的最终映射</div>
+    <div class="eq-math">
+      H<sup>pre</sup><sub>l</sub> = σ(H̃<sup>pre</sup><sub>l</sub>) &nbsp;&nbsp;<span style="color:#888">(sigmoid 保证非负)</span><br>
+      H<sup>post</sup><sub>l</sub> = 2σ(H̃<sup>post</sup><sub>l</sub>) &nbsp;&nbsp;<span style="color:#888">(2σ 保证非负且均值为1)</span><br>
+      H<sup>res</sup><sub>l</sub> = <strong>Sinkhorn-Knopp</strong>(H̃<sup>res</sup><sub>l</sub>) &nbsp;&nbsp;<span style="color:#7c3aed">(投影到双随机流形!)</span>
+    </div>
+  </div>
+
+  <div class="callout note">
+    <div class="callout-title">📝 设计细节</div>
+    <ul style="padding-left:18px;">
+      <li><strong>H<sup>pre</sup></strong> 用 sigmoid → 非负, 防止正负系数相消导致信号抵消</li>
+      <li><strong>H<sup>post</sup></strong> 用 <code>2σ</code> → 非负且期望值约为 1 (σ 输出 [0,1], 乘 2 后 [0,2], 均值≈1)</li>
+      <li><strong>H<sup>res</sup></strong> 用 Sinkhorn-Knopp → 双随机 (核心约束)</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ==================== 第5章: Sinkhorn-Knopp ==================== -->
+<section class="chapter" id="ch5">
+  <h2 class="chapter-title"><span class="num">5</span>Sinkhorn-Knopp 算法: 如何投影到双随机流形</h2>
+
+  <p>给定一个任意实数矩阵, 如何找到"最近"的双随机矩阵? <strong>Sinkhorn-Knopp 算法</strong>是经典解法: 先取指数让所有元素变正, 然后交替做行归一化和列归一化, 迭代收敛。</p>
+
+  <div class="eq-block">
+    <div class="eq-label">公式 (9) — Sinkhorn-Knopp 迭代</div>
+    <div class="eq-math">
+      M<sup>(0)</sup> = exp(H̃<sup>res</sup><sub>l</sub>) &nbsp;&nbsp;<span style="color:#888">(先取指数, 保证全正)</span><br>
+      M<sup>(t)</sup> = 𝒯<sub>r</sub>(𝒯<sub>c</sub>(M<sup>(t-1)</sup>)) &nbsp;&nbsp;<span style="color:#888">(交替行/列归一化)</span><br>
+      H<sup>res</sup><sub>l</sub> = M<sup>(t<sub>max</sub>)</sup> &nbsp;&nbsp;<span style="color:#888">(t<sub>max</sub>→∞ 时收敛到双随机)</span>
+    </div>
+  </div>
+
+  <p>其中 <code>𝒯<sub>r</sub></code> 是行归一化 (每行除以行和), <code>𝒯<sub>c</sub></code> 是列归一化。这个交替过程保证收敛到双随机矩阵。论文实际用 <code>t<sub>max</sub> = 20</code> 次迭代作为近似解。</p>
+
+  <div class="anim-container" id="anim4">
+    <div class="anim-header">
+      <span>🔄 Sinkhorn-Knopp 迭代过程 (4×4 矩阵, 20 步)</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="sinkhorn">迭代归一化</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">矩阵元素随迭代逐步调整, 行和与列和交替收敛到 1, 最终成为双随机矩阵</div>
+  </div>
+
+  <div class="callout warn">
+    <div class="callout-title">⚠️ 近似解的代价与补偿</div>
+    <p>20 次迭代只是<strong>近似</strong>双随机, 不完全精确。实测复合映射的<strong>反向梯度增益</strong>会略有偏差 (单层≈1, 复合后峰值约 1.6)。但相比 HC 的 3000, 这个偏差小了三个数量级, 完全可接受。这是"计算效率"与"约束精度"的务实折中。</p>
+  </div>
+</section>
+
+<!-- ==================== 第6章: 基础设施优化 ==================== -->
+<section class="chapter" id="ch6">
+  <h2 class="chapter-title"><span class="num">6</span>基础实施优化: 让 n=4 只多花 6.7%</h2>
+
+  <div class="callout why">
+    <div class="callout-title">💡 为什么需要这一章?</div>
+    <p>mHC 的数学很优雅, 但如果 n=4 让训练慢 4 倍, 没人会用。论文花大力气做系统工程, 最终把额外开销压到仅 <strong>6.7%</strong>。这证明 mHC 不只是理论漂亮, 而是<strong>可工业部署</strong>的。</p>
+  </div>
+
+  <h3 class="sub-title">6.1 Kernel Fusion (算子融合)</h3>
+  <p>用 <strong>TileLang</strong> 框架实现三个专用 fused kernel:</p>
+  <ul style="padding-left: 20px; margin-bottom: 14px;">
+    <li><strong>Kernel 1 (Eq.14-15)</strong>: 把对 <code>x⃗<sub>l</sub></code> 的两次扫描合并, 利用矩阵乘单元最大化带宽。反向的两个矩阵乘也合成单 kernel, 避免重复加载 <code>x⃗<sub>l</sub></code>。含精细的 load→cast→compute→store 流水线处理混合精度</li>
+    <li><strong>Kernel 2 (Eq.16-18)</strong>: 轻量系数操作融合成单 kernel, 减少启动开销</li>
+    <li><strong>Kernel 3 (Eq.19)</strong>: Sinkhorn-Knopp 迭代在单 kernel 内完成; 反向用自定义 kernel 在片上重算整个迭代</li>
+  </ul>
+  <p>还有两个应用 kernel: <code>𝓕<sub>pre</sub> = H<sup>pre</sup>·x</code> 和 <code>𝓕<sub>post,res</sub> = H<sup>res</sup>·x + H<sup>post⊤</sup>·𝓕</code>。通过把 H<sup>post</sup> 和 H<sup>res</sup> 的应用与残差合并融合, 该 kernel 的读取量从 <code>(3n+1)C</code> 降到 <code>(n+1)C</code>, 写入从 <code>3nC</code> 降到 <code>nC</code>。</p>
+
+  <p><strong>RMSNorm 重排技巧</strong>: 原本 RMSNorm 在高维 <code>x⃗<sub>l</sub> ∈ ℝ<sup>1×nC</sup></code> 上操作很慢。mHC 把"除以范数"挪到矩阵乘之后做, 数学等价但更快。同时把 RMSNorm 权重吸收进投影矩阵 φ。</p>
+
+  <h3 class="sub-title">6.2 选择性 Recomputing (重计算)</h3>
+  <p>n 条流的中间激活显存巨大。mHC 的策略: <strong>前向后丢弃 mHC kernel 的中间激活, 反向时重新计算</strong> (但不重算重的 𝓕 层函数)。对于连续 L<sub>r</sub> 层的块, 只需存第一层输入 <code>x<sub>l<sub>0</sub></sub></code>。</p>
+
+  <p>最优块大小 L<sub>r</sub>* 由总显存最小化决定:</p>
+  <div class="eq-block">
+    <div class="eq-label">公式 (20) — 最优重计算块大小</div>
+    <div class="eq-math">
+      L<sub>r</sub>* = argmin<sub>L<sub>r</sub></sub> [ nC × ⌈L/L<sub>r</sub>⌉ + (n+2)C × L<sub>r</sub> ] ≈ √(nL / (n+2))
+    </div>
+  </div>
+  <p>第一项是所有块的常驻显存 (每块存 nC), 第二项是当前活跃块的瞬时显存 ((n+2)C × L<sub>r</sub>)。两者平衡给出最优 L<sub>r</sub>* ≈ √(nL/(n+2))。实测这个值正好与流水线 stage 的层数对齐, 所以<strong>把重计算边界与流水线 stage 对齐</strong>。</p>
+
+  <h3 class="sub-title">6.3 DualPipe 通信重叠</h3>
+  <p>DeepSeek-V3 的 DualPipe 调度能重叠专家并行和流水线并行的通信。但 mHC 的 n 条流在 stage 边界引入<strong>额外通信延迟</strong>, 且 stage 边界要重算 L<sub>r</sub> 层的 mHC kernel。论文扩展 DualPipe 来重叠这些开销:</p>
+
+  <div class="anim-container" id="anim5">
+    <div class="anim-header">
+      <span>🌊 mHC 完整前向数据流 + 基础设施优化</span>
+      <div class="anim-controls">
+        <button class="anim-btn" data-scene="forward">前向数据流</button>
+        <button class="anim-btn" data-act="play">▶ 播放</button>
+        <button class="anim-btn" data-act="reset">↺ 重置</button>
+      </div>
+    </div>
+    <div class="anim-stage"><svg></svg></div>
+    <div class="anim-legend">从 x<sub>l</sub> 到 x<sub>l+1</sub> 的完整数据流, 含三路映射、层函数 𝓕、残差合并, 以及三大基础设施优化</div>
+  </div>
+
+  <ul style="padding-left: 20px; margin-bottom: 14px;">
+    <li><strong>专用高优先级流</strong>: MLP 层的 <code>𝓕<sub>post,res</sub></code> kernel 在专用高优先级计算流上执行, 防止阻塞通信流</li>
+    <li><strong>避免 persistent kernel</strong>: Attention 层不用长时 persistent kernel, 防止长时间占用导致通信 stall, 允许灵活抢占调度</li>
+    <li><strong>重计算与通信解耦</strong>: 每个 stage 的初始激活 <code>x<sub>l<sub>0</sub></sub></code> 已本地缓存, 重计算不依赖流水线通信</li>
+  </ul>
+</section>
+
+<!-- ==================== 第7章: 实验 ==================== -->
+<section class="chapter" id="ch8">
+  <h2 class="chapter-title"><span class="num">7</span>实验结果</h2>
+
+  <h3 class="sub-title">7.1 设置</h3>
+  <p>基于 DeepSeek-V3 MoE 架构, 训练 4 个模型变体: <strong>27B</strong> (主实验, 数据量与参数成比例) + <strong>3B/9B</strong> (计算缩放) + <strong>3B 固定 1T token</strong> (token 缩放)。HC 和 mHC 的扩展率 n=4。</p>
+
+  <h3 class="sub-title">7.2 训练稳定性与主结果</h3>
+  <p>27B 训练结果 (Figure 5, Table 4):</p>
+  <table class="data">
+    <tr><th>方法</th><th>训练稳定性</th><th>最终 loss</th><th>BBH</th><th>DROP</th><th>整体</th></tr>
+    <tr><td>Baseline (标准残差)</td><td>稳定</td><td>0.000 (基准)</td><td>—</td><td>—</td><td>基准</td></tr>
+    <tr><td>HC</td><td style="color:#dc2626">⚠️ 12k 步 loss 飙升</td><td>不稳定</td><td>—</td><td>—</td><td>部分提升但不稳</td></tr>
+    <tr class="highlight"><td>mHC (本文)</td><td style="color:#059669">✓ 稳定</td><td>-0.021 (优于基线)</td><td>+2.1%</td><td>+2.3%</td><td>全面优于 HC</td></tr>
+  </table>
+  <p>mHC 不仅消除了 HC 的训练不稳定, 还在下游 8 个 benchmark 上全面超过 baseline, 在推理任务 (BBH +2.1%, DROP +2.3%) 上比 HC 进一步提升。</p>
+
+  <h3 class="sub-title">7.3 缩放实验</h3>
+  <p>从 3B/9B 到 27B 的<strong>计算缩放曲线</strong> (Figure 6a): mHC 的性能优势在不同计算预算下<strong>稳健保持</strong>, 仅边际衰减。3B 模型的 <strong>token 缩放曲线</strong> (Figure 6b) 同样验证有效。结合内部大规模训练, 确认 mHC 在大规模场景下有效。</p>
+
+  <h3 class="sub-title">7.4 稳定性分析 — 核心证据</h3>
+  <p>Figure 7 直接对比传播稳定性。理想情况下单层映射的前向增益 (行和) 和反向增益 (列和) 都应等于 1:</p>
+  <table class="data">
+    <tr><th>指标</th><th>HC</th><th>mHC</th><th>改善</th></tr>
+    <tr><td>单层前向增益 (行和)</td><td>偏离 1, 波动大</td><td>≈1 (精确)</td><td>✓</td></tr>
+    <tr><td>单层反向增益 (列和)</td><td>偏离 1, 波动大</td><td>≈1 (略有偏差, 因 20 次迭代近似)</td><td>✓</td></tr>
+    <tr><td>复合映射峰值增益</td><td style="color:#dc2626"><strong>≈3000</strong></td><td class="highlight" style="color:#059669"><strong>≈1.6</strong></td><td>降低 ~1875×</td></tr>
+  </table>
+  <p>Figure 8 的映射矩阵可视化进一步显示: HC 当最大增益大时, <strong>其他值也普遍偏大</strong>, 说明所有传播路径都不稳定; 而 mHC 一致地给出稳定结果。</p>
+
+  <div class="callout insight">
+    <div class="callout-title">🎯 一句话总结实验</div>
+    <p>mHC 用双随机约束把复合映射增益从 3000 压到 1.6 (三个数量级), 换来训练稳定 + loss 下降 0.021 + 下游任务全面提升, 代价仅 6.7% 额外训练时间。</p>
+  </div>
+</section>
+
+<!-- ==================== 第8章: 总结 ==================== -->
+<section class="chapter" id="ch9">
+  <h2 class="chapter-title"><span class="num">8</span>总结与展望</h2>
+
+  <div class="callout why">
+    <div class="callout-title">💡 核心贡献</div>
+    <p>本文识别出 HC 的根本问题: <strong>无约束连接破坏信号能量守恒</strong>, 导致训练不稳定和扩展性受限。mHC 通过把残差映射投影到双随机矩阵流形, 把信号传播变成特征的凸组合, <strong>恢复了恒等映射的守恒性质</strong>, 同时保留了多流混合的表达力。配合 kernel fusion + 重计算 + DualPipe 通信重叠, 实现仅 6.7% 额外开销的工业级部署。</p>
+  </div>
+
+  <h3 class="sub-title">8.1 方法论启示</h3>
+  <p>mHC 的思路有普适价值: <strong>不要在"自由"和"恒等"之间二选一, 而是找一个流形, 让自由落在守恒的子空间里</strong>。这调和了 ResNet 的稳定性和 HC 的表达力这对矛盾。</p>
+
+  <h3 class="sub-title">8.2 未来方向</h3>
+  <ul style="padding-left: 20px; margin-bottom: 14px;">
+    <li><strong>其他流形约束</strong>: 双随机只是其中一种选择, 可探索针对不同学习目标的几何约束, 在可塑性与稳定性之间寻找更优折中</li>
+    <li><strong>宏观架构设计复兴</strong>: mHC 希望重燃社区对拓扑结构设计的兴趣 — 过去十年大家都盯着块内部, 块间拓扑还有大量空间</li>
+    <li><strong>拓扑如何影响优化与表示学习</strong>: 深入理解结构如何影响梯度流和表征形成, 可能照亮下一代基础架构的演化路径</li>
+  </ul>
+
+  <div class="callout note">
+    <div class="callout-title">📎 论文链接</div>
+    <p>原文: <a href="https://arxiv.org/abs/2512.24880" target="_blank">arXiv:2512.24880v2</a> | HTML: <a href="https://arxiv.org/html/2512.24880v2" target="_blank">arxiv.org/html/2512.24880v2</a></p>
+    <p>引用: Xie et al., "mHC: Manifold-Constrained Hyper-Connections", 2025.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="page">
+    <p>mHC 论文详解 · 基于 arXiv:2512.24880v2 · 由 Hermes Agent 生成</p>
+  </div>
+</footer>
+
+<script src="assets/anim.js"></script>
+</body>
+</html>

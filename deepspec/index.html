@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSpec / DSpark 深度讲解 — 半自回归推测解码</title>
+<link rel="stylesheet" href="assets/deepspec.css">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<!-- ============ HERO ============ -->
+<div class="hero">
+<div class="hero-inner">
+<h1>DeepSpec &amp; DSpark 深度讲解</h1>
+<p class="subtitle">Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation</p>
+<div class="meta-grid">
+  <span class="badge"><span class="dot green"></span>DeepSeek-AI · 2026</span>
+  <span class="badge"><span class="dot blue"></span>论文: DSpark (见 DSpark_paper.pdf)</span>
+  <span class="badge"><span class="dot purple"></span>仓库: deepseek-ai/DeepSpec</span>
+  <span class="badge"><span class="dot orange"></span>3 算法: DSpark / DFlash / Eagle3</span>
+  <span class="badge"><span class="dot yellow"></span>2 模型族: Qwen3 / Gemma4</span>
+</div>
+</div>
+</div>
+
+<!-- ============ NAV ============ -->
+<nav class="toc">
+<div class="toc-inner">
+  <a href="#sec1">1. 全景</a>
+  <a href="#sec2">2. 背景</a>
+  <a href="#sec3">3. 架构</a>
+  <a href="#sec4">4. Markov/RNN Head</a>
+  <a href="#sec5">5. Confidence + 调度</a>
+  <a href="#sec6">6. 训练</a>
+  <a href="#sec7">7. 评估</a>
+  <a href="#sec8">8. 生产部署</a>
+  <a href="#sec9">9. 源码补充</a>
+  <a href="#summary">总结</a>
+</div>
+</nav>
+
+<main>
+
+<!-- ============ §1 全景 ============ -->
+<section id="sec1">
+<h2><span class="sec-num">1.</span>DeepSpec 是什么：一个算法驱动的推测解码训练全栈</h2>
+<p class="lead">DeepSpec 是 DeepSeek-AI 开源的<strong>推测解码（speculative decoding）草稿模型训练与评估仓库</strong>。它不是单一算法，而是一个"算法驱动"的框架——把三种风格迥异的草稿模型放在同一套数据、同一套训练循环、同一套 benchmark 下公平比较，并附带 DeepSeek 自家的新算法 <em>DSpark</em> 的完整实现与论文。</p>
+
+<h3>1.1 三种草稿模型：两条技术路线的完整枚举</h3>
+<p>仓库当前包含三种 draft model，它们代表了推测解码"草稿器"设计的两条主流路线：</p>
+
+<table>
+<caption>表 1.1 — DeepSpec 支持的三种草稿模型（配置文件见 <code>config/&lt;algo&gt;/</code>）</caption>
+<thead>
+<tr><th>算法</th><th>类型</th><th>起草方式</th><th>仓库来源</th><th>配置数</th></tr>
+</thead>
+<tbody>
+<tr><td><span class="pill purple">DSpark</span></td><td>半自回归 (semi-AR)</td><td>并行 backbone + 轻量串行 head</td><td>DeepSeek 自家论文</td><td>4 (Qwen3-4B/8B/14B + Gemma4-12B)</td></tr>
+<tr><td><span class="pill blue">DFlash</span></td><td>并行 (parallel)</td><td>单次前向产生整块</td><td>改编自 z-lab/dflash (MIT)</td><td>4</td></tr>
+<tr><td><span class="pill orange">Eagle3</span></td><td>自回归 (AR)</td><td>逐步采样，TTT 训练</td><td>改编自 SpecForge (Apache-2.0)</td><td>4</td></tr>
+</tbody>
+</table>
+
+<div class="callout purple">
+<span class="ctitle">为什么要把三种放在一起？</span>
+论文 §4.1 明确说明：为了公平比较，<strong>三种 drafter 在同一框架、同一数据 (Open-PerfectBlend 1.3M 样本)、同一 target feature layers 下重新训练</strong>。Eagle3 的 TTT horizon (7) 对齐 DSpark/DFlash 的 block_size (7)，draft 层数 Eagle3=1、DSpark/DFlash=5。这样 accepted length 的差异就只能归因于架构本身，而非训练配方。
+</div>
+
+<h3>1.2 仓库结构与文件 census</h3>
+<p>整个仓库 90 个文件，67 个 Python 文件，结构非常清晰：</p>
+
+<div class="cards">
+  <div class="card">
+    <span class="pill purple">deepspec/modeling/dspark</span>
+    <h4>DSpark 核心实现</h4>
+    <p><code>markov_head.py</code> 定义三种串行 head；<code>common.py</code> 负责 anchor 采样、noise embed、block attention mask；<code>loss.py</code> 组合 CE + TV/L1 + confidence 损失；<code>{qwen3,gemma4}/modeling.py</code> 承接模型族前向。</p>
+  </div>
+  <div class="card">
+    <span class="pill orange">deepspec/modeling/eagle3</span>
+    <h4>自回归对照组</h4>
+    <p>Eagle3 作为 AR drafter baseline，没有 DSpark 的 block/markov 结构，用来隔离并行 backbone 与串行 head 的架构收益。</p>
+  </div>
+  <div class="card">
+    <span class="pill blue">trainer / data / eval</span>
+    <h4>训练与评估管线</h4>
+    <p><code>trainer</code> 放训练循环和 ckpt 管理；<code>data</code> 读取 target cache 与预取；<code>eval</code> 复用 DSpark/Eagle3 evaluator 做 speculative decoding 指标。</p>
+  </div>
+  <div class="card">
+    <span class="pill green">config / scripts / eval_datasets</span>
+    <h4>实验入口</h4>
+    <p><code>config/{dspark,dflash,eagle3}</code> 覆盖 3 类算法 × 4 个 target；<code>scripts</code> 负责数据、训练、评估；<code>eval_datasets</code> 存放 GSM8K、MATH500、AIME、HumanEval、MBPP 等 benchmark。</p>
+  </div>
+</div>
+
+<p>一个值得注意的细节：<code>eval.py</code> 的 <code>EVALUATORS</code> 字典里只有 DSpark 和 Eagle3 两个键——<strong>DFlash 没有独立评估器</strong>。这是因为 DSpark 的并行 backbone 本身就是 DFlash（论文 §3.1："a parallel backbone (in our instantiation, DFlash)"），DSpark 评估器复用 DFlash 的 backbone 前向，只是在上面叠加了 Markov head 和 confidence head。这也解释了为什么 <code>deepspec/eval/</code> 下没有 <code>dflash/</code> 目录。</p>
+
+<h3>1.3 工作流：三阶段流水线</h3>
+<p>README 描述的三阶段流水线，每阶段的输出喂给下一阶段：</p>
+
+<div class="mermaid-wrap">
+<div class="mermaid-toolbar">
+  <button data-act="in">+</button>
+  <button data-act="out">−</button>
+  <button data-act="reset">重置</button>
+</div>
+<div class="mermaid-viewport">
+<div class="mermaid-zoom-inner">
+<div class="mermaid">
+flowchart LR
+    A["1. 数据准备<br/>下载 prompts<br/>target 重新生成答案<br/>构建 target cache 约 38TB"] --> B["2. 训练<br/>train.py 每卡一 worker<br/>读 cache, 采样 anchor<br/>冻结 target, 只训 draft"]
+    B --> C["3. 评估<br/>eval.py 跑 9 个 benchmark<br/>测 accepted length<br/>可选 confidence 早停"]
+</div>
+</div>
+</div>
+</div>
+
+<div class="callout orange">
+<span class="ctitle">为什么 target cache 高达 38TB？</span>
+DSpark 的训练需要 target model 的<strong>逐 token 完整分布</strong>（full-vocabulary logits，词表约 15 万）作为监督信号（见 §6 的 TV 损失）。1.3M 样本 × 平均几千 token × 15 万维 float = 数十 TB 量级。把这份监督信号预先算好缓存到磁盘，训练时就不再需要反复跑 target model——这是把"需要 target 在线"的在线蒸馏转化为"离线读 cache"的静态训练的关键工程决策。论文 §5.1 还提到一个生产优化：只缓存 hidden states（LM head 前的激活），LM head 投影在 draft worker 本地算，把通信复杂度从 O(V) 降到 O(d)。
+</div>
+
+</section>
+
+<!-- ============ §2 背景 ============ -->
+<section id="sec2">
+<h2><span class="sec-num">2.</span>背景：为什么需要"半自回归"</h2>
+
+<h3>2.1 推测解码的基本博弈</h3>
+<p>推测解码用一个轻量 draft model 提议 γ 个候选 token，target model 单次前向验证整块，接受最长的一致前缀并补一个 bonus token。每个解码周期的平均每 token 延迟为：</p>
+
+<div class="formula">τ = ( t<sub>draft</sub> + t<sub>verify</sub> ) / τ<sub>acc</sub> &nbsp;&nbsp;&nbsp; (论文式 1)</div>
+
+<p>三个杠杆：<strong>降低 t<sub>draft</sub>（起草更快）、提升 τ<sub>acc</sub>（起草更准）、降低有效 t<sub>verify</sub>（验证更聪明）</strong>。三种 drafter 架构分别在这三个杠杆上做不同取舍。</p>
+
+<h3>2.2 两类 drafter 的根本 trade-off</h3>
+
+<table>
+<caption>表 2.1 — 自回归 vs 并行 drafter 的根本矛盾</caption>
+<thead><tr><th></th><th>自回归 (Eagle3)</th><th>并行 (DFlash)</th></tr></thead>
+<tbody>
+<tr><td>起草方式</td><td>逐步采样，每步依赖前一步</td><td>单次前向同时产出所有位置</td></tr>
+<tr><td>t<sub>draft</sub> 随 block_size</td><td>O(γ) 线性增长</td><td>≈ O(1) 几乎无关</td></tr>
+<tr><td>能用的网络深度</td><td>被迫浅 (1 层)，否则延迟太高</td><td>可用深网络 (5 层)</td></tr>
+<tr><td>位置 1 容量</td><td>低 (浅网络)</td><td>高 (深网络)</td></tr>
+<tr><td>后段 (位置 2-7) 质量</td><td>高 (条件于已采样前缀)</td><td>低 (各位置独立，多模态碰撞)</td></tr>
+</tbody>
+</table>
+
+<div class="callout red">
+<span class="ctitle">核心痛点：多模态碰撞 (multi-modal collision)</span>
+并行 drafter 每个位置对<strong>所有可能的前驱</strong>做边际化，而不是条件于实际采样的那个前驱。当上下文有多个合理续接（如 "of course" 和 "no problem"），并行 drafter 可能把两个模式的片段拼成 "of problem" 或 "no course"——每个位置单独看都对，组合起来却不一致。这导致<strong>接受率沿 block 快速衰减（suffix decay）</strong>，后段 token 几乎必被拒绝，浪费起草和验证算力。
+</div>
+
+<h3>2.3 DSpark 的设计目标：鱼和熊掌</h3>
+<p>论文 §4.3.1 用一张关键图（论文 Figure 2）揭示了反直觉现象：<strong>并行 drafter 的全局 accepted length 居然能超过自回归 drafter</strong>。原因在于位置 1 的容量差距——DFlash 在位置 1 的条件接受率（0.88 数学 / 0.72 聊天）远高于 Eagle3（0.81 / 0.53），而位置 1 被拒会让整块作废，所以位置 1 的杠杆最大。但 DFlash 在后段快速衰减，DSpark 的目标就是<strong>保留并行 backbone 的高位置 1 容量，同时用轻量串行 head 补上后段的依赖建模</strong>。</p>
+
+<div class="callout green">
+<span class="ctitle">DSpark 的两板斧</span>
+<b>① Semi-autoregressive generation（§3.1）</b>：重计算交给并行 backbone（快），只追加一个轻量串行 head 注入 intra-block 依赖（准）——同时拿到"快"和"后段不衰减"。<br><br>
+<b>② Confidence-scheduled verification（§3.2）</b>：confidence head 估计每个位置的存活概率，hardware-aware scheduler 按实时负载动态裁剪验证长度——把验证算力只投到期望回报最高的 token 上，解决高并发下的验证浪费。
+</div>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig2.png" alt="DSpark Figure 2 位置条件接受率">
+<figcaption><strong>论文 Figure 2</strong> — 位置条件接受率（Qwen3-4B target）。该指标只统计前驱全部被接受的实例，从而隔离每个位置的<strong>基础预测质量</strong>。关键现象：自回归的 Eagle3（橙）后段稳定甚至上升；并行的 DFlash（蓝）后段快速衰减（多模态碰撞）；DSpark（绿）<strong>起点高（继承深并行 backbone）+ 后段不衰减（Markov head 补依赖）</strong>，兼得两家之长。这正是 §2.3 "鱼和熊掌" 设计目标的实证支撑。</figcaption>
+</figure>
+
+</section>
+
+<!-- ============ §3 架构 ============ -->
+<section id="sec3">
+<h2><span class="sec-num">3.</span>DSpark 架构：半自回归的两段式生成</h2>
+<p class="lead">DSpark 把一次草稿生成拆成两段：并行 backbone 先一次性产出所有位置的 base logits，再由轻量串行 head 逐位置叠加一个"转移偏置"。两段加起来才形成最终的 block 内自回归分布。</p>
+
+<h3>3.1 一个解码周期的完整流程</h3>
+<p>给定 prompt（如 ABC），target model 执行一步生成锚点 token D，DSpark 以 D 为输入生成 EFGH 四个草稿 token 及对应置信度 c1-c4，调度器保留 EFG、丢弃低置信的 H，target 验证 EFG，接受 EF、拒绝 G 并补 G'：</p>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig1.png" alt="DSpark Figure 1 架构总览">
+<figcaption><strong>论文 Figure 1</strong> — DSpark 架构与解码周期（静态结构图，见上方）。</figcaption>
+</figure>
+
+<p class="fig-caption">下方动画展示其执行时序 —— 按"播放"或逐步查看：</p>
+
+<div class="anim-stage" data-anim="decode-cycle">
+  <p class="anim-caption">动画① DSpark 解码周期：① target 生成锚点 D → ② 并行 backbone 同时产出 7 logits + 串行 head 逐个采样 EFGH + 调度器裁剪 H → ③ target 验证接受 EF、补 G' → next round。</p>
+</div>
+
+<h3>3.2 并行段（Parallel stage）：DFlash backbone 的小改造</h3>
+<p>DSpark 的并行 backbone 直接复用 DFlash（论文 §3.1）。DFlash 的核心机制是<strong>KV injection</strong>：从 target model 的若干层抽取 hidden states，拼接后投影到 draft 的 hidden 空间，作为上下文注入 draft 每一层的 K/V：</p>
+
+<div class="formula">h<sup>ctx</sup> = RMSNorm( W<sub>π</sub> · [ h<sup>(l₁)</sup> ; ... ; h<sup>(l_L)</sup> ] ) &nbsp;&nbsp;&nbsp; (论文式 2)<br>
+K = [ h<sup>ctx</sup> ; K<sup>draft</sup> ], &nbsp; V = [ h<sup>ctx</sup> ; V<sup>draft</sup> ] &nbsp;&nbsp;&nbsp; (论文式 3)</div>
+
+<p>从源码看，这个机制落得很具体：<code>extract_context_feature</code> 先把 <code>target_layer_ids</code> 指定的多层 hidden states 沿 hidden 维拼接；draft 模型里的 <code>fc</code> 再把 <code>L × hidden_size</code> 压回 <code>hidden_size</code>，并经过 <code>hidden_norm</code> 得到 <code>h_ctx</code>。进入每个 draft attention 层时，<code>k_proj/v_proj</code> 分别作用在 <code>target_hidden_states</code> 和 draft 自己的 <code>hidden_states</code> 上，然后执行 <code>torch.cat([k_ctx, k_noise], dim=1)</code> 与 <code>torch.cat([v_ctx, v_noise], dim=1)</code>。也就是说，DFlash 的“并行能力”不是来自更大的 mask token 输入本身，而是来自<strong>每个 draft query 都能在注意力里读到 target 的多层上下文 K/V</strong>。</p>
+
+<div class="callout blue">
+<span class="ctitle">KV injection 的核心直觉</span>
+普通并行 drafter 只能靠自身的浅层上下文去猜整块 token；DFlash 先让强 target 跑过前缀，把中间层语义压成一段可注意力读取的上下文记忆，再把这段记忆插到 draft 每一层的 K/V 里。draft 仍然一次前向并行产生整块 logits，但每个位置的 query 都不是“盲猜”，而是在读取 target 留下的多层特征。
+</div>
+
+<p class="fig-caption">下方动画展示 KV injection 的数据流 —— 按"播放"或逐步查看：</p>
+
+<div class="anim-stage" data-anim="dflash-kv-injection">
+  <p class="anim-caption">动画② DFlash KV injection：target 多层 hidden → 拼接投影成 h_ctx → 注入每层 draft attention 的 K/V → draft mask/anchor positions 并行读取上下文 → 一次前向产出整块 base logits。</p>
+</div>
+
+<p>DSpark 对 DFlash backbone 做了<strong>一处小修改</strong>：原版 DFlash 输入"锚点 + γ 个 mask"，只预测 mask 位置；DSpark 复用锚点所在的输入槽来预测<strong>锚点后的第一个新 token</strong>，于是 γ 个输入（1 锚点 + γ-1 mask）产出 γ 个 draft logits。这减少了起草计算量却维持相近质量。</p>
+
+<div class="callout">
+<span class="ctitle">为什么这个改造有效</span>
+原版 DFlash 锚点 token 只充当"条件"，不产出预测——相当于浪费了一个前向位置。DSpark 让锚点输入槽也产出 logit，意味着同样的 backbone 前向多得到一个有用预测，单位算力的产出更高。论文 §4.3.2 的延迟测量显示这个改造几乎零开销。
+</div>
+
+<div class="callout green">
+<span class="ctitle">不是重猜锚点，而是用锚点槽预测 next token</span>
+可以把区别理解成：DFlash 的 D 位置只有 <strong>token / condition 粒度</strong>作用，D 作为已知干净 token 放进输入，让后面的 mask 位置 attend 到它；但 D 这个输入槽本身不对应一个要输出的 draft logit。DSpark 的 D 位置同时承担两件事：一方面 D 仍然作为已知锚点提供条件，另一方面 D 这个槽经过 DFlash backbone 后产生 hidden state，再接 LM head，输出用于预测 <strong>D 后面的第一个新 token E</strong> 的 logit。所以不是"D 位置输出 D 的 logits"，而是 <strong>D 这个输入位置既提供条件 token，又把自己的计算结果用来预测 next token</strong>。
+</div>
+
+<div class="callout yellow">
+<span class="ctitle">原版 DFlash 里的锚点 token 是什么</span>
+DFlash 原论文 §4.2 把 anchor 定义在 masked block 的构造里：训练时从 target 生成的干净 response token 中随机选一个 token 作为 block 的第一个位置，后面的若干位置替换成 mask；推理时对应的就是上一轮 target 验证后留下来的<strong>干净 token</strong>，通常是已接受前缀的最后一个 token，或者 target 在拒绝/补偿时产生的 bonus token。它的作用不是被 draft 猜出来，而是告诉 block diffusion drafter："从这个已经可信的 token 往后，去并行补全接下来的 mask 位置。" 所以原版 DFlash 的 anchor 更像一枚<strong>起跑线钉子</strong>：它固定 block 的左边界并提供条件，但自己不贡献一个候选 logit。
+</div>
+
+<p class="fig-caption">下方动画把原版 DFlash 与 DSpark 的输入/输出位置对齐比较 —— 按"播放"或逐步查看：</p>
+
+<div class="anim-stage" data-anim="dspark-anchor-logit">
+  <p class="anim-caption">动画③ 锚点位置复用：原版 DFlash 用锚点 D 作为条件，再用 γ 个 mask 预测 γ 个 token；DSpark 把 D 所在位置也纳入预测，1 个锚点 + γ-1 个 mask 就产出 γ 个 logits，同样前向得到更多有效输出。</p>
+</div>
+
+<h3>3.3 串行段（Sequential stage）：因果 block 分布</h3>
+<p>串行段不重新定义一个全局归一化的能量模型，而是通过<strong>自回归因式分解</strong>诱导一个因果 block 分布：</p>
+
+<div class="formula">p(x<sub>k</sub> | x<sub>0</sub>, x<sub>&lt;k</sub>) = softmax( z<sub>k</sub><sup>(π)</sup> + b(x<sub>0</sub>, x<sub>&lt;k</sub>, x<sub>k</sub>) ) &nbsp;&nbsp;&nbsp; (论文式 4)</div>
+
+<p>其中 z<sub>k</sub><sup>(π)</sup> 是并行 backbone 在位置 k 产出的 base logit，b(·) 是串行段附加的"前缀依赖转移偏置"。推理时从左到右采样。由于采样本质是串行的，这个 block 必须<strong>计算上足够轻（serial ≪ parallel）</strong>，保证整体延迟仍由并行段主导。论文提供了两种实现——Markov head 和 RNN head（见 §4）。</p>
+
+<div class="callout green">
+<span class="ctitle">关键设计：per-token 概率保持精确 softmax</span>
+论文 §6 相关工作特别强调：CRF-NAT、CTC-drafter 等也把串行模块叠在并行 hidden 上，但它们的全局归一化分函数或隐变量边际化<strong>无法给出精确的 per-token 概率</strong>，而推测解码的拒绝采样规则<strong>严格要求</strong>每个候选 token 有精确概率。DSpark 把串行修正限制在<strong>局部</strong>（只影响当前 token 的 logit，不做全局归一化），所以每个 token 的概率仍是标准 softmax 评估——这是 DSpark 能保证无损（lossless）的理论根基。
+</div>
+
+<p class="fig-caption">下方动画对比两段生成的节奏差异 —— 按"播放"或逐步查看：</p>
+
+<div class="anim-stage" data-anim="two-stage-gen">
+  <p class="anim-caption">动画④ 两段式生成节奏对比：上行并行段一次前向同时产出所有 base logits（快但后段衰减）；下行串行段逐位置采样，每步的 markov bias 依赖前一步结果（flyPacket 可视化，慢一点但后段不衰减）。DSpark = 上行 + 下行叠加。</p>
+</div>
+
+<h3>3.4 训练时的 attention mask：anchor-bounded packing</h3>
+<p>代码 <code>deepspec/modeling/dspark/common.py</code> 的 <code>create_dspark_attention_mask</code> 用 PyTorch flex_attention 实现了 block 级的稀疏 mask。核心逻辑（<code>dspark_mask_mod</code>）：</p>
+
+<pre><code>def dspark_mask_mod(b, h, q_idx, kv_idx):
+    q_block_id = q_idx // block_size
+    anchor_pos = anchor_positions[b, q_block_id]
+    is_context = kv_idx &lt; seq_len
+    mask_context = is_context &amp; (kv_idx &lt; anchor_pos)   # 只看锚点之前的 context
+    is_draft = kv_idx &gt;= seq_len
+    kv_block_id = (kv_idx - seq_len) // block_size
+    mask_draft = is_draft &amp; (q_block_id == kv_block_id)  # block 内双向
+    is_valid_block = block_keep_mask[b, q_block_id]
+    return (mask_context | mask_draft) &amp; is_valid_block</code></pre>
+
+<div class="callout yellow">
+<span class="ctitle">为什么用 token 级 attention index 而非 2D padding mask</span>
+论文 §5.1 的"anchor-bounded sequence packing"：从训练序列里采样多个锚点，把每个锚点后的 block 当作独立预测块<strong>打包进同一个 dense batch</strong>。标准 2D padding mask 会因为大量 padding 浪费显存和算力；改用 token 级 attention index 后，多个独立序列/锚点共享同一个 batch，既保持精确的因果 mask 又避免 padding 开销。这正是 <code>create_block_mask</code> + 自定义 <code>mask_mod</code> 的价值——flex_attention 把它编译成稀疏 attention kernel。
+</div>
+
+</section>
+
+<!-- ============ §4 Markov/RNN Head ============ -->
+<section id="sec4">
+<h2><span class="sec-num">4.</span>三种串行 head：从一阶马尔可夫到 RNN</h2>
+<p class="lead">串行段的核心是 <code>markov_head.py</code> 里定义的三种 head，它们都继承自 <code>VanillaMarkov</code>，区别在于"转移偏置 b 能看到多少历史"。<code>build_markov_head(config)</code> 工厂函数按 <code>markov_head_type</code> 字段选择实例化哪个。</p>
+
+<h3>4.0 数学总览：并行 base logits + 串行前缀 bias</h3>
+<p>DSpark 的 draft 分布不是单独由 backbone 给出，而是把一次并行前向得到的 base logits 与一个轻量串行 head 产生的前缀相关偏置相加：</p>
+
+<div class="formula">
+z<sub>k</sub><sup>draft</sup> = z<sub>k</sub><sup>base</sup> + b<sub>k</sub>, &nbsp;&nbsp;
+q<sub>θ</sub>(x<sub>k</sub> | C, x<sub>&lt;k</sub>) = softmax(z<sub>k</sub><sup>draft</sup>)
+</div>
+
+<p>其中 <code>z_k^{base}</code> 来自并行 backbone 的 <code>compute_logits(output_hidden)</code>，一次性覆盖整个 block；<code>b_k</code> 来自 <code>markov_head.apply_block_logits(...)</code> 或推理时的 <code>sample_block_tokens(...)</code>。这就是半自回归的关键：<strong>重计算交给并行 backbone，块内依赖交给很小的串行 bias</strong>。</p>
+
+<table>
+<caption>表 4.0 — 三种 head 在统一公式里的差异</caption>
+<thead><tr><th>Head</th><th>b<sub>k</sub> 依赖项</th><th>数学直觉</th><th>代码入口</th></tr></thead>
+<tbody>
+<tr><td><span class="pill gray">VanillaMarkov</span></td><td>x<sub>k-1</sub></td><td>低秩 bigram 转移表</td><td><code>compute_step_bias</code></td></tr>
+<tr><td><span class="pill blue">GatedMarkovHead</span></td><td>x<sub>k-1</sub>, h<sub>k</sub></td><td>上下文门控的 bigram 转移</td><td><code>compute_gate</code></td></tr>
+<tr><td><span class="pill purple">RNNHead</span></td><td>s<sub>k-1</sub>, x<sub>k-1</sub>, h<sub>k</sub></td><td>块内前缀压缩状态</td><td><code>_rnn_step</code></td></tr>
+</tbody>
+</table>
+
+<div class="callout green">
+<span class="ctitle">训练和推理为什么能对齐</span>
+训练时 <code>prev_token_ids</code> 是 <code>[anchor_token, target_ids[:-1]]</code>，即用真实前一个 token 做 teacher forcing；推理时每一步把刚采样出的 token 回填成下一步的 <code>prev_token_ids</code>。因此训练学到的是"给定前一个实际 token，如何修正当前位置分布"，推理恰好使用同一个条件结构，只是前一个 token 从真值换成了 draft 自己刚采出的样本。
+</div>
+
+<div class="callout yellow">
+<span class="ctitle">一阶马尔可夫的原理：把长历史压缩成"上一个状态"</span>
+马尔可夫假设说：预测下一步时，不必显式记住完整历史，只保留一个足够代表当前处境的"状态"。一阶马尔可夫把这个状态极简化为<strong>上一个 token</strong>：<code>P(x_k | x_0...x_{k-1}) ≈ P(x_k | x_{k-1})</code>。在自然语言里，这对应 bigram 搭配偏好，比如 <code>of → course</code> 比 <code>of → problem</code> 更顺。DSpark 里的 Markov head 不是拿这个假设替代 backbone；backbone 已经通过 KV injection 和并行前向吸收了长上下文，Markov head 只负责给当前位置加一个<strong>局部转移修正项</strong>，专门修复并行生成最容易丢掉的块内相邻依赖。
+</div>
+
+<table>
+<caption>表 4.0.1 — 一阶马尔可夫在 DSpark 中的含义</caption>
+<thead><tr><th>概念</th><th>传统马尔可夫链</th><th>DSpark Markov head</th></tr></thead>
+<tbody>
+<tr><td>状态</td><td>当前状态 s<sub>k-1</sub></td><td>前一个实际 token <code>x_{k-1}</code></td></tr>
+<tr><td>转移</td><td><code>P(s_k | s_{k-1})</code></td><td><code>b(x_{k-1}, ·)</code>，对整个词表的 logit bias</td></tr>
+<tr><td>作用</td><td>单独决定下一状态分布</td><td>只修正 <code>base_logits</code>，不替代 backbone</td></tr>
+<tr><td>价值</td><td>用短记忆近似长历史</td><td>用极小串行成本补上相邻 token 搭配</td></tr>
+</tbody>
+</table>
+
+<h3>4.1 VanillaMarkov：一阶马尔可夫 + 低秩分解</h3>
+<p>最简单的实例化：转移偏置只依赖<strong>前一个 token</strong> x<sub>k-1</sub>，即一阶转移 b(x<sub>k-1</sub>, ·)。理论上这是 V×V 的完整转移矩阵 B；实际用低秩分解 B ≈ W₁W₂ 逼近（默认 rank=256）：</p>
+
+<div class="formula">b(x<sub>k-1</sub>, ·) = W₁[x<sub>k-1</sub>] · W₂ &nbsp;∈ ℝ<sup>V</sup> &nbsp;&nbsp;&nbsp; (论文式 5)</div>
+
+<p>W₁ 是 embedding 查表（V×r），W₂ 是 logit 投影（r×V）。代码里就是两行：</p>
+<pre><code>self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)  # V×r 查表
+self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)  # r×V 投影
+
+def compute_step_bias(self, token_ids, hidden_states):
+    del hidden_states  # ← 注意: vanilla 不用 backbone hidden
+    return self.project_bias(self.get_prev_embeddings(token_ids))</code></pre>
+
+<div class="callout">
+<span class="ctitle">为什么 vanilla 显式 <code>del hidden_states</code></span>
+VanillaMarkov 的转移偏置<strong>完全不用</strong> backbone 的 hidden state——它是一个纯粹的 token-id 到 logit-bias 的查表 + 线性映射。这保证它的计算量极小（一次 embedding lookup + 一次矩阵乘），串行循环即使跑 16 步也几乎不增加延迟。代码用 <code>del hidden_states</code> 显式表达"这个 head 不需要 hidden"的契约。
+</div>
+
+<div class="callout green">
+<span class="ctitle">为什么有效：回到 "of problem" 的例子</span>
+当位置 1 采样出 "of"，Markov head 查 W₁["of"] 得到一个 256 维向量，经 W₂ 投影成 V 维 bias，<strong>提升 "course" 的 logit、抑制 "problem"</strong>。于是位置 2 更可能采出 "course" 而非 "problem"——串行依赖就这样被注入了。低秩 (r=256) 让存储和单步计算都很小，即便词表 V≈15 万也高效。
+</div>
+
+<div class="callout yellow">
+<span class="ctitle">论文怎么解释"打破多模态碰撞"</span>
+论文 §3.1 的问题设定是：并行 drafter 一次前向产出 γ 个位置的 logits，但这些位置之间<strong>没有条件依赖</strong>。当上下文允许多个合理续写模式时，例如 <code>of course</code> 和 <code>no problem</code>，第 1 位可能倾向采 <code>of</code> 或 <code>no</code>，第 2 位却不知道第 1 位最终采了哪个，只能对所有可能前驱做边际化，于是可能把两个模式交叉拼成 <code>of problem</code> 或 <code>no course</code>。这就是 multi-modal collision：每个位置单独看都像是高概率 token，但组合后的路径不属于同一个一致模式。Markov head 的作用就是在第 1 位实际采出 <code>of</code> 后，把这个已实例化 token 写回下一步条件，给 <code>course</code> 加转移偏置、给 <code>problem</code> 减偏置；也就是把"边际化所有前驱"改成"条件于实际前驱"，从而缓解后段接受率快速衰减。
+</div>
+
+<h4>4.1.1 逐步拆解：一阶马尔可夫 + 低秩分解到底在做什么</h4>
+
+<p>这三层概念层层递进，下面逐一拆开。</p>
+
+<div class="anim-stage" data-anim="markov-low-rank">
+  <p class="anim-caption">动画⑤ Markov 低秩偏置：完整 V×V 转移表太大，低秩分解为 W₁ 查表 + W₂ 投影；当 prev token 是 "of" 时，bias 提升 "course"、压低 "problem"，再与 backbone base logits 相加得到最终采样分布。</p>
+</div>
+
+<p><strong>① 一阶马尔可夫 = "只看前一个词"</strong></p>
+<p>位置 k 的偏置<strong>只取决于</strong>位置 k-1 那一个 token，不看 k-2、k-3 更早的历史。举例：前面采出 "of"，就查"of 后面通常接什么"给 "course" 加分；它<strong>不看</strong>更前面的词。这等价于一张<strong>转移表</strong>：给定前驱 token <code>i</code>，查表得到一个 V 维向量（对词表每个 token 的偏置值）。</p>
+
+<p><strong>② 完整转移表有多大：V×V 矩阵</strong></p>
+<p>词表 V ≈ 15 万（Qwen3）。完整的"一阶转移偏置"是一个 <strong>V × V 的矩阵 B</strong>：</p>
+
+<p><strong>③ 低秩分解 = 用两个小矩阵近似大矩阵</strong></p>
+<p>关键观察：大部分 (前驱 i, 后继 j) 组合根本不会出现（比如"的"后面不会接"量子"）。完整矩阵 B 大部分是 0 或噪声，<strong>真正的转移模式可以用更少的维度表达</strong>。低秩分解把 B 拆成两个小矩阵相乘：</p>
+
+<p>一个类比：与其存一张 15万×15万 的"两词搭配表"（225 亿格），不如给每个词发一张 <strong>256 维的性格名片</strong>（W₁），再用一个共享的<strong>名片解读器</strong>（W₂）把名片翻译成"对所有词的偏好分数"。两张名片"对得上"的词就容易相邻。</p>
+
+<table>
+<caption>表 4.1.1 — 完整矩阵 vs 低秩分解的参数量对比</caption>
+<thead><tr><th></th><th>完整矩阵 B</th><th>低秩分解 W₁+W₂ (r=256)</th></tr></thead>
+<tbody>
+<tr><td>形状</td><td>V × V</td><td>(V × r) + (r × V)</td></tr>
+<tr><td>参数量</td><td>15万² = <strong>225 亿</strong></td><td>2 × 15万 × 256 ≈ <strong>7680 万</strong></td></tr>
+<tr><td>压缩比</td><td>1×</td><td><strong>1/2930</strong>（减少 99.97%）</td></tr>
+<tr><td>单步计算</td><td>查表 O(1) 但存不下</td><td>查表 O(1) + 矩阵乘 O(r×V) ≈ 3840 万 FLOPs</td></tr>
+<tr><td>能否表达</td><td>精确</td><td>近似，但 256 维足以区分主要搭配模式</td></tr>
+</tbody>
+</table>
+
+<p><strong>④ "of → course vs of → problem" 的数值示意</strong></p>
+<p>假设 W₁["of"] 是一个 256 维向量，W₂ 把它投影回 V 维。关键：投影后 "course" 的偏置是正的（+2.3，加分），"problem" 是负的（-1.8，减分），于是位置 2 更可能采出 "course"。上面的动画第 4-5 步把这个加法过程展开成了可视化 logits 条形图。</p>
+
+<p><strong>⑤ 为什么 r=256 够用</strong></p>
+<p>论文 §4.3.2 的实验结果把这个取舍说得很清楚：在 Qwen3-4B 上，固定 γ=7 时，DSpark 从 1 层加到 2 层收益最大，<strong>2 层 DSpark 已经超过 5 层 DFlash</strong>，说明轻量串行依赖比单纯堆深并行层更划算。固定 5 层、把 proposal length 扩到 {4,8,12,16} 时，DSpark 在所有长度都优于 DFlash，且越长优势越大：γ=7 时数学/代码/聊天分别提升 <strong>16% / 15% / 18%</strong>，γ=15 时扩大到 <strong>30% / 26% / 22%</strong>。RNN head 只在长 proposal 上比 Markov head 多一点边际收益，但实现和部署复杂度更高；同时 γ 从 4 增到 16 时，串行循环只给整轮延迟增加 <strong>0.2%~1.3%</strong>。所以 r=256 的一阶 Markov head 已经用很小代价吃到主要收益，足以作为默认选择。</p>
+
+<table>
+<caption>表 4.1 — 论文 §4.3.2 对 Markov head 默认选择的实验证据</caption>
+<thead><tr><th>实验维度</th><th>设置</th><th>结果</th><th>结论</th></tr></thead>
+<tbody>
+<tr><td>Drafter 深度</td><td>γ=7，DSpark 1→5 层，对比 5 层 DFlash</td><td>1→2 层边际收益最大；2 层 DSpark 已超过 5 层 DFlash</td><td>局部自回归修正比单纯堆并行层更高效</td></tr>
+<tr><td>Proposal 长度</td><td>5 层，γ∈{4,8,12,16}</td><td>DSpark 全长度优于 DFlash；γ=7 提升 16%/15%/18%，γ=15 提升 30%/26%/22%</td><td>Markov head 抑制 suffix decay，长块越长越值</td></tr>
+<tr><td>RNN 对比</td><td>Markov head vs RNN head</td><td>RNN 主要只在长 proposal 上有边际收益</td><td>默认用 Markov head 更利于实现与部署</td></tr>
+<tr><td>延迟开销</td><td>batch=128，γ 从 4 增到 16</td><td>整轮延迟仅增加 0.2%~1.3%</td><td>串行采样循环不是主要瓶颈</td></tr>
+</tbody>
+</table>
+
+<h3>4.2 GatedMarkovHead：用 backbone hidden 调制</h3>
+<p>Vanilla 的偏置对所有上下文相同（只看 token id）。Gated 版本引入一个门控，让 backbone 的 hidden state h<sub>k</sub> 调制 markov embedding：</p>
+
+<pre><code>class GatedMarkovHead(VanillaMarkov):
+    def __init__(self, *, vocab_size, markov_rank, hidden_size):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
+
+    def compute_step_bias(self, token_ids, hidden_states):
+        prev_embeddings = self.get_prev_embeddings(token_ids)          # W1[x_{k-1}]
+        gate = self.compute_gate(token_ids, hidden_states)             # sigmoid(W[ h_k ; W1[x_{k-1}] ])
+        return self.project_bias(gate * prev_embeddings)               # W2 · (gate ⊙ W1[x_{k-1}])</code></pre>
+
+<p>门控 = sigmoid(W<sub>g</sub>·[h<sub>k</sub> ; W₁[x<sub>k-1</sub>]])，对 markov embedding 做逐元素门控。这让<strong>相同的前驱 token 在不同上下文下产生不同的偏置</strong>——比 vanilla 更具表达力，但多了一次 sigmoid 和 hidden 拼接。</p>
+
+<h3>4.3 RNNHead：记忆整个块内前缀</h3>
+<p>Markov head 是无记忆的——位置 k 看不到 k-1 之前的 token。RNN head 放松这个限制，用一个 GRU 式的循环状态 s 累积<strong>块内完整前缀历史</strong>：</p>
+
+<div class="formula">z = [ s<sub>k-1</sub> ; W₁[x<sub>k-1</sub>] ; h<sub>k</sub> ] &nbsp;∈ ℝ<sup>2r+d</sup><br>
+s<sub>k</sub> = g ⊙ s<sub>k-1</sub> + (1-g) ⊙ tanh(c), &nbsp; b(&lt;,·) = W₂·tanh(o)<br>
+其中 [g; c; o] = joint_proj(z), &nbsp; s<sub>0</sub> = 0 &nbsp;&nbsp;&nbsp; (论文式 6)</div>
+
+<div class="callout yellow">
+<span class="ctitle">GRU 式循环状态的原理</span>
+这里的 <code>s_k</code> 不是再存一串 token，而是把已经采过的块内前缀压缩成一个 <code>r</code> 维状态。每一步先把旧状态 <code>s_{k-1}</code>、前一个实际 token 的低秩 embedding <code>W₁[x_{k-1}]</code>、当前位置 backbone hidden <code>h_k</code> 拼起来，得到当前要不要更新记忆的依据。门 <code>g</code> 接近 1 时保留旧状态，接近 0 时用候选记忆 <code>tanh(c)</code> 覆盖更多；因此更新式 <code>s_k = g⊙s_{k-1} + (1-g)⊙tanh(c)</code> 本质上是在“沿用已有前缀模式”和“写入刚发生的新 token 信息”之间做逐维插值。最后 <code>o</code> 不直接当状态，而是生成当前位置的词表 bias，让 RNN head 用压缩后的前缀记忆修正 base logits。
+</div>
+
+<p>代码把 gate/candidate/output 三个投影<strong>合并成一个 linear</strong>（<code>joint_proj = nn.Linear(2*markov_rank + hidden_size, 3*markov_rank)</code>），再 chunk 成三段——这是常见的 GRU 参数复用技巧。</p>
+
+<pre><code>def _rnn_step(self, state, prev_embeddings, hidden_states):
+    z = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
+    proj = self.joint_proj(z)
+    gate_raw, candidate_raw, output_raw = proj.chunk(3, dim=-1)
+    gate = torch.sigmoid(gate_raw)
+    candidate = torch.tanh(candidate_raw)
+    new_state = gate * state + (1.0 - gate) * candidate
+    bias = self.project_bias(torch.tanh(output_raw))
+    return new_state, bias</code></pre>
+
+<h3>4.4 三种 head 的对比与默认选择</h3>
+
+<table>
+<caption>表 4.1 — 三种串行 head 的设计对比</caption>
+<thead><tr><th>Head</th><th>可见历史</th><th>用 backbone hidden</th><th>参数</th><th>默认</th></tr></thead>
+<tbody>
+<tr><td><span class="pill gray">VanillaMarkov</span></td><td>仅 x<sub>k-1</sub></td><td>否 (<code>del hidden</code>)</td><td>W₁(V×r) + W₂(r×V)</td><td><strong>是</strong> (论文默认)</td></tr>
+<tr><td><span class="pill blue">GatedMarkovHead</span></td><td>x<sub>k-1</sub> + h<sub>k</sub> 门控</td><td>是</td><td>+ W<sub>g</sub>((d+r)×r)</td><td>否</td></tr>
+<tr><td><span class="pill purple">RNNHead</span></td><td>整个块内前缀 (经 state)</td><td>是</td><td>+ W<sub>joint</sub>((2r+d)×3r)</td><td>否 (长 block 时略优)</td></tr>
+</tbody>
+</table>
+
+<div class="callout orange">
+<span class="ctitle">为什么默认用最简单的 Markov head 而非 RNN</span>
+论文 §4.3.2 的实验（论文 Figure 4）：RNN head 只在<strong>更长的 proposal length</strong>（如 γ=15）时比 Markov head 有边际增益，短 block (γ=7) 几乎无差。考虑到 RNN 实现复杂度更高、部署属性更差（状态管理、CUDA graph 不友好），论文选 Markov head 作默认。<strong>这里的取舍是"用最小代价拿到 90% 收益"</strong>——一阶马尔可夫已经足以打破多模态碰撞，更长程依赖的边际回报递减。
+</div>
+
+<h3>4.5 采样循环：sample_block_tokens 的自回归展开</h3>
+<p>三种 head 都实现了 <code>sample_block_tokens</code>，它把并行 backbone 产出的 base_logits 按位置<strong>自回归展开</strong>：每步用当前 prev_token 查 markov bias、叠加到 base_logits、采样、把采样结果作为下一步的 prev_token。以 VanillaMarkov 为例：</p>
+
+<pre><code>def sample_block_tokens(self, base_logits, *, first_prev_token_ids, hidden_states, temperature=0.0):
+    sampled_tokens, corrected_logits = [], []
+    prev_token_ids = first_prev_token_ids.long()
+    for step_idx in range(proposal_len):
+        step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
+        step_logits = self.apply_step_logits(            # base + markov_bias
+            base_logits[:, step_idx, :], token_ids=prev_token_ids, hidden_states=step_hidden)
+        corrected_logits.append(step_logits.unsqueeze(1))
+        next_token_ids = sample_tokens(step_logits.unsqueeze(1), temperature=temperature).squeeze(1)
+        sampled_tokens.append(next_token_ids)
+        prev_token_ids = next_token_ids                  # ← 串行依赖在这传递
+    return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)</code></pre>
+
+<div class="callout">
+<span class="ctitle">为什么这个循环不会拖慢推理</span>
+循环体只有：一次 embedding lookup (W₁)、一次小矩阵乘 (W₂, r×V)、一次采样。当 r=256、V≈15 万时，单步约几万 FLOPs，远小于 backbone 一次前向的数 GFLOPs。论文 §4.3.2 测量：γ 从 4 加到 16，串行循环只让整轮延迟增加 0.2%-1.3%（论文 Figure 4 右）——因为 target 验证在 batch=128 时主导计算时间。
+</div>
+
+<h4>4.5.1 分布学习目标：为什么 bias 要贴近 target 全分布</h4>
+<p>串行 head 最终改变的是整个词表上的概率分布，而不是只改变 ground-truth token 的分数。因此训练里除了交叉熵，还用 target logits 做全分布匹配。设 draft 和 target 的单步分布分别为 q 与 p，则推测解码的单步软接受率为：</p>
+
+<div class="formula">
+α<sub>k</sub> = 1 - ½‖q<sub>k</sub> - p<sub>k</sub>‖<sub>1</sub>
+</div>
+
+<p>所以最小化 L1/TV 距离等价于直接提高接受率。代码在 <code>loss.py</code> 里用 <code>softmax(outputs.draft_logits)</code> 与 <code>softmax(aligned_target_logits)</code> 计算 L1，同时用同一个公式得到 <code>accept_rate_3d</code> 作为 confidence head 的软标签。换句话说，Markov/RNN head 学的是"怎样让草稿分布更像 target 分布"，confidence head 学的是"这个相似度会带来多大接受概率"。</p>
+
+<div class="callout yellow">
+<span class="ctitle">为什么一阶 Markov 往往已经够用</span>
+并行 draft 的主要错误不是完全不会理解长程语义，而是块内位置彼此不知道前一个位置到底采了什么，导致多模态碰撞。给当前位置补上 <code>x<sub>k-1</sub></code> 这一个真实前驱，已经能消掉大量局部歧义；RNN 的全前缀状态当然更强，但在短 block（默认 block_size=7）里边际收益容易被额外状态管理成本吃掉。
+</div>
+
+<h3>4.6 生动速记:三种 head 的拟人化谱系</h3>
+<p class="lead">前面四节讲了实现细节,这里给一组拟人化别名与动机补遗,方便快速建立直觉。</p>
+
+<div class="callout">
+<span class="ctitle">动机补遗:并行 backbone 的"盲点"</span>
+DSpark 的 backbone 一次前向并行吐出整块 base_logits,快但有个致命伤——<strong>块内各位置独立采样,看不见彼此</strong>。位置 1 采出 "of",位置 2 的 base_logits 觉得 "problem" 和 "course" 差不多高,独立采样可能采出 "of problem"——语法上应是 "of course"。并行 backbone 没法修正,因为它不知道位置 1 采了啥。串行 head 就是来打这个补丁:在 base_logits 上叠加一个依赖"前一个实际采出 token"的 bias,把串行依赖注回去。
+</div>
+
+<p>三种 head 的差别,一句话:<strong>bias 能看到多少历史</strong>。</p>
+
+<div class="cards">
+  <div class="card">
+    <span class="pill gray">VanillaMarkov</span>
+    <h4 style="margin:10px 0 6px;">「只记得昨天的人」</h4>
+    <p style="margin:0;">每天的行为<strong>只取决于昨天</strong>——前天的事全忘光。选词时只问"上一个词是啥",查"性格名片"(W₁,256维)经"解读器"(W₂)翻成对每个候选词的偏好分。低秩分解把 225 亿格的完整搭配表压到 7680 万参数(1/2930),靠的是洞察:大部分词对根本不会相邻,真正的转移模式用 256 维就够表达。</p>
+    <p style="margin:8px 0 0;color:var(--text-dim);font-size:13px;">可见历史:仅 x<sub>k-1</sub> · 用 hidden:否</p>
+  </div>
+  <div class="card">
+    <span class="pill blue">GatedMarkovHead</span>
+    <h4 style="margin:10px 0 6px;">「会看场合的人」</h4>
+    <p style="margin:0;">vanilla 像个<strong>只会背搭配表的书呆子</strong>:看到"of"就机械给"course"加分,不管语境。Gated 像个<strong>会看场合的人</strong>:同样看到"of",先扫一眼当前语境(hidden h_k),用 sigmoid 门控决定"这次该信多少搭配表"。语境明确("because of")→门接近 0,让 backbone 说了算;语境模糊("___ of")→门接近 1,充分信任搭配表。门控 ⊙ 名片 = "按场合调节名片各维度的音量"。</p>
+    <p style="margin:8px 0 0;color:var(--text-dim);font-size:13px;">可见历史:x<sub>k-1</sub> + h<sub>k</sub> 门控 · 用 hidden:是</p>
+  </div>
+  <div class="card">
+    <span class="pill purple">RNNHead</span>
+    <h4 style="margin:10px 0 6px;">「带着日记本的人」</h4>
+    <p style="margin:0;">每走一步在日记本(state s)上记一笔,下一步翻看<strong>整本日记</strong>再决定 bias。日记本里:s<sub>k-1</sub>=昨天的日记(累积前缀)、W₁[x<sub>k-1</sub>]=今天刚发生的事、h_k=当前场合、门 g="日记该改写多少"(g 大保留旧记忆,g 小用新候选覆盖)。GRU 的妙处是<strong>可遗忘</strong>:门 g 让 state 选择性保留早期信息、丢弃噪声,比简单累加更鲁棒。</p>
+    <p style="margin:8px 0 0;color:var(--text-dim);font-size:13px;">可见历史:整个块内前缀 · 用 hidden:是</p>
+  </div>
+</div>
+
+<h4>谱系一览:记忆范围的递进</h4>
+<div class="mermaid-wrap">
+<div class="mermaid-viewport">
+<div class="mermaid-zoom-inner">
+<div class="mermaid">
+flowchart LR
+    subgraph S1["无记忆"]
+        A["纯并行 backbone<br/>看不见邻居"]
+    end
+    subgraph S2["一阶"]
+        B["Vanilla / Gated<br/>只记得昨天 / 会看场合"]
+    end
+    subgraph S3["全前缀"]
+        C["RNN<br/>带着日记本"]
+    end
+    A -->|"叠加 bias"| B
+    B -->|"引入 state"| C
+
+    style S1 fill:#f6f8fa,stroke:#8b949e,stroke-width:1.5px,color:#57606a
+    style S2 fill:#ddf4ff,stroke:#0969da,stroke-width:1.5px,color:#0969da
+    style S3 fill:#fbefff,stroke:#8957e5,stroke-width:1.5px,color:#8957e5
+    linkStyle 0 stroke:#0969da,stroke-width:2px
+    linkStyle 1 stroke:#8957e5,stroke-width:2px
+</div>
+</div>
+</div>
+</div>
+<p style="text-align:center;color:var(--text-dim);font-size:13px;margin-top:-4px;">表达力递增,部署复杂度也递增 → DSpark 默认选最左档(一阶),用最小代价拿 90% 收益</p>
+
+</section>
+
+<!-- ============ §5 Confidence + 调度 ============ -->
+<section id="sec5">
+<h2><span class="sec-num">5.</span>Confidence Head 与 Hardware-Aware 调度</h2>
+<p class="lead">DSpark 的第二板斧解决的是<strong>系统级</strong>问题：大 block 草稿容易产出，但盲目验证整个 block 在高并发下会浪费 target 的 batch 容量。confidence head 估计每个位置的存活概率，调度器据此动态裁剪验证长度。</p>
+
+<h3>5.1 Confidence Head：预测前缀存活概率</h3>
+<p>confidence head 对每个草稿位置 k 输出一个标量 ĉ<sub>k</sub> ∈ (0,1)，<strong>建模的是"在前驱都被接受的前提下，位置 k 也被 target 接受的条件概率"</strong>。架构极轻量——一个线性投影 + sigmoid：</p>
+
+<div class="formula">ĉ<sub>k</sub> = σ( W<sub>c</sub> · [ h<sub>k</sub> ; W₁[x<sub>k-1</sub>] ] ) &nbsp;&nbsp;&nbsp; (论文式 7)</div>
+
+<p>注意输入特征：backbone hidden h<sub>k</sub> <strong>拼接 Markov embedding W₁[x<sub>k-1</sub>]</strong>——即 confidence head 复用了 Markov head 的查表，共享前驱 token 的表征。代码 <code>common.py</code> 的 <code>AcceptRatePredictor</code> 就是 <code>nn.Linear(input_dim, 1)</code>，<code>extract_context_feature</code> 负责拼接多层 hidden。</p>
+
+<h3>5.2 监督信号：从 TV 距离推导解析接受率</h3>
+<p>confidence head 的监督标签<strong>不是</strong> 0/1 的接受/拒绝硬标签，而是从 draft 与 target 分布的<strong>总变差距离 (Total Variation)</strong>解析推导的软接受率：</p>
+
+<div class="formula">α<sub>k</sub> = 1 - ½ ‖ p<sub>k</sub><sup>draft</sup> - p<sub>k</sub><sup>target</sup> ‖<sub>1</sub> &nbsp;&nbsp;&nbsp; (论文式 8)</div>
+
+<div class="callout green">
+<span class="ctitle">为什么用 TV 距离作为监督</span>
+推测解码的拒绝采样规则下，<strong>单步接受概率恰好等于 1 - ½TV(p_draft, p_target)</strong>（Leviathan et al. 2023）。所以最小化 TV 距离 = 最大化接受率，这是一个<strong>直接的代理指标</strong>。用解析推导的 α<sub>k</sub> 作软标签训练 confidence head，让它学会预测"这个位置有多大概率被接受"——这比硬标签信息更丰富，且可直接由 target cache（含完整 target logits）离线计算。
+</div>
+
+<h3>5.3 Sequential Temperature Scaling (STS)：事后校准</h3>
+<p>原始 confidence estimate 通常<strong>过度自信</strong>（ECE 3%-8%）。但 hardware-aware scheduler 需要<strong>累积存活概率的绝对数值</strong>来估算期望接受长度，过度自信会让调度估算失真。STS 解决这个问题：</p>
+
+<div class="callout purple">
+<span class="ctitle">STS 的因果链式校准</span>
+因为每个 ĉ<sub>k</sub> 建模的是<strong>条件</strong>概率，链式法则下前缀被接受的联合概率 = 累积乘积 ∏ĉ<sub>k</sub>。STS 在验证集上<strong>从左到右逐位置</strong>做 1D 网格搜索：在每个位置 k 找最优温度标量 T<sub>k</sub>，对 confidence logit 做温度缩放后取 sigmoid，最小化<strong>累积乘积</strong> ∏<sub>i≤k</sub> sigmoid(logit<sub>i</sub>/T<sub>i</sub>) 的 ECE，且已校准的前驱位置保持固定。<br><br>
+关键：温度缩放是<strong>保序变换</strong>——它修正预测概率的数值去匹配经验接受率，但<strong>不改变 token 间的相对排名</strong>。所以 confidence head 学到的判别能力（哪些 token 更可能被拒）被完整保留。校准后平均 ECE 降到 1%（论文 Figure 6）。
+</div>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig6.png" alt="DSpark Figure 6 STS 校准 reliability diagram">
+<figcaption><strong>论文 Figure 6</strong> — Reliability Diagram（Alpaca 数据集，位置 1/3/5/7）。原始 confidence estimate（中列）虽判别力强（ROC-AUC 0.81-0.90）但过度自信（ECE 3%-8%）；STS 校准后（右列）预测概率与经验接受率对齐，平均 ECE 降至 1%。左列为完美校准对照。STS 是 hardware-aware scheduler 能精确估算累积存活概率的前提。</figcaption>
+</figure>
+
+<h3>5.4 Hardware-Aware Prefix Scheduler：全局吞吐最大化</h3>
+<p>这是 DSpark 最有系统品味的部分。静态阈值（如"confidence &lt; 0.5 就裁"）在单请求假设下有效，但在高并发生产系统里<strong>次优</strong>——验证一个低置信 token 的机会成本取决于当前负载：轻载时几乎免费，重载时占用本可服务其他请求的 batch 容量。</p>
+
+<div class="callout yellow">
+<span class="ctitle">开源源码与论文生产系统的边界</span>
+当前开源仓库的 <code>eval.py</code> 只实现单请求的静态 <code>--confidence-threshold</code> 裁剪与 confidence 诊断；下面的 SPS 查表、全局 greedy scheduler、异步 ZOS 和变长 kernel 适配来自 DSpark 论文的生产系统描述，不是本仓库里可直接运行的调度器源码。
+</div>
+
+<h4>问题形式化</h4>
+<p>一批 N 个活跃请求，请求 i 的验证长度 ℓ<sub>i</sub> ∈ {0,...,γ}。因为推测解码只接受连续前缀，位置 k 的存活概率 = 累积乘积 ρ<sub>i,k</sub> = ∏<sub>j≤k</sub> c<sub>i,j</sub>。单次验证的 batch size（token 计）B = Σ(1+ℓ<sub>i</sub>)，期望接受 token 数 A = Σ(1 + Σ<sub>k≤ℓ</sub>ρ<sub>i,k</sub>)。设 SPS(B) 为引擎在 batch size B 下的吞吐（steps/s，预 profile 一次存成查表），目标是最大化系统级 token 吞吐 Φ = A · SPS(B)。</p>
+
+<h4>贪心解 + 早停保证无损</h4>
+<div class="anim-stage" data-anim="scheduler-greedy">
+  <p class="anim-caption">动画⑥ 调度器贪心搜索：左表按 ρ 降序逐行 admit（B/A/Φ 数值滚动），右曲线 Φ=A·SPS(B) 爬升。Φ 到峰值后继续 admit 会下降——此时早停 break（黄色 branchArrow），返回 best 对应验证长度。早停保证无损性：截断决策只依赖已处理前缀。</p>
+</div>
+
+<div class="callout red">
+<span class="ctitle">为什么必须早停：无损性的因果屏障</span>
+计算下一个存活概率 ρ<sub>i,k+1</sub> <strong>显式需要已实例化的候选 token x<sub>i,k</sub></strong>（因为 confidence head 用了 Markov feature W₁[x<sub>k-1</sub>]）。如果做<strong>回顾式全局搜索</strong>，会把 x<sub>i,k</sub> 泄露进位置 k 的 admit 决策——这违反了无损推测解码的"非预期性"（non-anticipating）要求（论文 Appendix A 给了反例）。<strong>早停</strong>让截断决策只依赖到当前步为止的前缀，隔离了未来 token，保证精确恢复 target 分布。<br><br>
+这个早停在 Φ 单峰时给出全局最优；真实硬件 SPS 曲线是离散锯齿的，论文 §5.2 给了工程适配（见 §8）。
+</div>
+
+<h3>5.5 离线阈值扫描：confidence head 的诊断</h3>
+<p>论文 §4.3.3（论文 Figure 5）用静态阈值扫描验证 confidence head 的判别力：阈值从 0 升到 0.8，整体接受率稳步上升——因为低价值后缀被裁掉。<strong>聊天任务</strong>剪枝最显著（接受率 45.7% → 95.7%），数学/代码因本身可预测性高、剪枝较温和（76.9%→92.5%、67.6%→92.0%）。这正好对应 §7 主结果里"结构化任务接受长度天然更高"的领域效应。</p>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig5.png" alt="DSpark Figure 5 confidence 阈值扫描">
+<figcaption><strong>论文 Figure 5</strong> — Confidence 阈值扫描（Qwen3-4B）。柱状=每步平均 token 数（实心=接受，斜线=拒绝），折线=整体接受率。阈值升高时低价值后缀被裁掉，接受率稳步上升。聊天任务剪枝最显著（45.7%→95.7%），结构化任务（数学/代码）因本身可预测性高、剪枝较温和。这正是 confidence head 能识别低价值后缀的实证。</figcaption>
+</figure>
+
+</section>
+
+<!-- ============ §6 训练 ============ -->
+<section id="sec6">
+<h2><span class="sec-num">6.</span>训练：三项损失与离线 target cache</h2>
+<p class="lead">DSpark 的训练目标是三项加权和，全部由一个位置衰减权重加权。target model 全程冻结，draft 只更新 backbone + 串行 head + confidence head，embedding 和 LM head 共享自 target 且冻结。</p>
+
+<h3>6.1 三项损失：CE + TV + Confidence</h3>
+
+<div class="formula"><b>L</b> = α<sub>ce</sub>·L<sub>ce</sub> + α<sub>tv</sub>·L<sub>tv</sub> + α<sub>conf</sub>·L<sub>conf</sub> &nbsp;&nbsp;&nbsp; (论文式 12)<br>
+默认权重: α<sub>ce</sub>=0.1, &nbsp; α<sub>tv</sub>=0.9, &nbsp; α<sub>conf</sub>=1.0</div>
+
+<table>
+<caption>表 6.1 — 三项损失的设计意图</caption>
+<thead><tr><th>损失</th><th>公式</th><th>监督什么</th><th>为什么需要</th></tr></thead>
+<tbody>
+<tr><td><span class="pill blue">L<sub>ce</sub></span><br>交叉熵</td><td>-Σ w<sub>k</sub> log p(x*<sub>k</sub>)<br>(式 9)</td><td>draft 预测正确下一个 token</td><td>基础监督，但只看 ground-truth token</td></tr>
+<tr><td><span class="pill purple">L<sub>tv</sub></span><br>分布匹配</td><td>Σ w<sub>k</sub>·½‖p<sup>draft</sup>-p<sup>target</sup>‖<sub>1</sub><br>(式 10)</td><td>draft 分布贴近 target 分布</td><td><strong>直接最大化接受率</strong>（TV=接受率补数）。CE 只看正确 token，TV 看整个分布形状——即使 ground-trunk token 一样，分布偏了也会被拒</td></tr>
+<tr><td><span class="pill orange">L<sub>conf</sub></span><br>置信度 BCE</td><td>-Σ w<sub>k</sub>[α log ĉ + (1-α) log(1-ĉ)]<br>(式 11)</td><td>confidence head 预测软接受率 α</td><td>调度器需要精确的存活概率估计，必须端到端训练校准</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<span class="ctitle">为什么 TV 权重 (0.9) 远大于 CE (0.1)</span>
+推测解码的接受概率 = 1 - ½TV。所以 <strong>TV 距离是接受率的直接、可微的代理</strong>——最小化 TV 直接最大化期望接受长度。CE 只在 ground-truth token 上监督，无法区分"分布虽偏但恰好压对 token"的情况；TV 强制整个分布形状贴近 target，这正是无损验证关心的。CE 保留小权重作为"别完全忽略正确 token"的兜底。
+</div>
+
+<h3>6.2 位置衰减权重：w<sub>k</sub> = exp(-(k-1)/γ)</h3>
+<p>三项损失都按位置衰减权重 w<sub>k</sub> = exp(-(k-1)/γ) 加权（γ 是衰减常数，config 里 <code>loss_decay_gamma=4.0</code>）。<strong>越靠前的位置权重越大</strong>——因为前缀式验证下，位置 1 被拒会让整块作废，前段 token 对期望接受长度的贡献最大。这与 §2.3 "位置 1 杠杆最大"的分析一致。代码 <code>loss.py</code> 的 <code>_build_loss_weight_mask</code> 实现：</p>
+
+<pre><code>def _build_loss_weight_mask(*, eval_mask, block_size, device, loss_decay_gamma):
+    loss_weight_mask = eval_mask.to(torch.float32)
+    if loss_decay_gamma is not None and loss_decay_gamma > 0:
+        positions = torch.arange(block_size, device=device).view(1, 1, -1)
+        decay_weights = torch.exp(-positions.float() / float(loss_decay_gamma))
+        loss_weight_mask = loss_weight_mask * decay_weights
+    return loss_weight_mask</code></pre>
+
+<h3>6.3 Anchor 采样：从长序列随机抽块</h3>
+<p>训练时从每条 target 序列里<strong>随机采样多个锚点位置</strong>，每个锚点后取一个 block_size 长度的预测块作为训练数据（论文 §3.3）。代码 <code>common.py</code> 的 <code>sample_anchor_positions</code> 实现核心逻辑：</p>
+
+<ol>
+<li><code>build_anchor_candidate_mask</code>：候选锚点需满足"锚点本身和它的第一个 target 都在 loss_mask 内"（<code>anchor_valid &amp; first_target_valid</code>）。</li>
+<li>对每个候选位置生成随机数，<strong>排序后取前 num_anchors 个</strong>——这是无放回均匀采样。</li>
+<li>不足时用 pad + <code>block_keep_mask</code> 标记哪些是有效锚点。</li>
+</ol>
+
+<div class="callout green">
+<span class="ctitle">为什么随机采样多个锚点而非用整条序列</span>
+长序列（4K token）整条做 block 预测会让一条样本只贡献少量梯度信号且计算低效。<strong>采样多个锚点</strong>让一条样本产出多个独立训练块，等效于数据增强 + dense packing。配合 §3.4 的 anchor-bounded packing，这些块被打包进同一个 batch 共享 attention kernel，无 padding 浪费。config 里 <code>num_anchors=512</code> 意味着每条样本采 512 个锚点块。
+</div>
+
+<h3>6.4 Noise Embed：用 mask token 填充 block</h3>
+<p>锚点确定后，block 的输入怎么构造？<code>create_noise_embed</code> 把锚点 token 放在 block 首位，其余位置填 <code>mask_token_id</code>（Qwen3 是 151669）：</p>
+
+<pre><code>noise_ids = torch.full((bsz, num_blocks * block_size), mask_token_id, ...)
+# 锚点 token 填到每个 block 的起始位置
+block_starts = torch.arange(num_blocks, device=device) * block_size
+noise_ids[flat_batch_idx, block_starts] = anchor_tokens  # 只在有效 block 填真 token
+return embed_tokens(noise_ids)</code></pre>
+
+<p>这正是 §3.2 描述的 DSpark 改造：输入 = [锚点, mask, mask, ..., mask]，backbone 一次前向产出所有位置的 base logits（包括锚点位置本身）。</p>
+
+<h3>6.5 Target Cache：38TB 的离线监督</h3>
+<p>数据管线（<code>scripts/data/</code>）三步走：</p>
+<ol>
+<li><strong>download_and_split.py</strong>：从 <code>mlabonne/open-perfectblend</code> 下载 1.3M 样本，5% 划入 eval，95% 训练。</li>
+<li><strong>generate_train_data.py</strong>：用 SGLang 起多个 target worker（默认 8 个 Qwen3-4B on port 30000-30007），<strong>重新生成</strong> assistant 答案（因为训练要用 target 自己生成的分布，而非数据集原始答案）。</li>
+<li><strong>prepare_target_cache.py</strong>：把 target model 跑一遍，<strong>预计算每个位置的完整 logits 和多层 hidden states</strong>存到 <code>~/.cache/deepspec/&lt;target&gt;_target_cache</code>（约 38TB）。</li>
+</ol>
+
+<div class="callout orange">
+<span class="ctitle">为什么必须"重新生成答案"</span>
+训练的 TV 损失需要 target model 在<strong>它自己生成的 token 序列上</strong>的分布。如果用数据集原始答案，target 在那些 token 上的分布可能与它自己生成时不同——监督信号不一致。所以先用 target 以推荐采样参数重新生成，再对这批"target 自产"序列算完整分布缓存。这是一致性 vs 数据多样性的取舍：牺牲原始数据的多样性，换取监督信号与推理时 target 行为的一致。
+</div>
+
+<h3>6.6 配置全景：dspark_qwen3_4b.py</h3>
+<p>默认 config 揭示了所有关键超参：</p>
+<pre><code>model = dict(
+    target_model_name_or_path="Qwen/Qwen3-4B",
+    block_size=7,                        # γ=7, 与 Eagle3 TTT horizon 对齐
+    num_draft_layers=5,                  # 并行 backbone 5 层 (Eagle3 只 1 层)
+    target_layer_ids=[1, 9, 17, 25, 33], # 从 target 哪些层抽 hidden 做 KV injection
+    mask_token_id=151669,                # Qwen3 的 mask token
+    num_anchors=512,                     # 每条样本采 512 个锚点块
+    markov_rank=256,                     # 低秩分解的 r
+    markov_head_type='vanilla',          # 默认用最简单的 Markov head
+    confidence_head_alpha=1.0,           # confidence 损失权重
+    confidence_head_with_markov=True,    # confidence 特征拼接 markov embedding
+    loss_decay_gamma=4.0,                # 位置衰减常数
+    ce_loss_alpha=0.1,                   # CE 权重 (小)
+    l1_loss_alpha=0.9,                   # TV(L1) 权重 (大)
+)
+train = dict(
+    lr=6.0e-4, warmup_ratio=0.04, precision="bf16",
+    local_batch_size=1, global_batch_size=512,  # 8 卡 × 64 累积
+    num_train_epochs=10, torch_compile=True,
+)</code></pre>
+
+<div class="callout">
+<span class="ctitle">代码里的 l1_loss 对应论文的 L_tv</span>
+代码里的 <code>l1_loss_alpha</code> 计算的是 <code>(draft_probs - target_probs).abs().sum(dim=-1)</code>——这正是 TV 距离的 2 倍（L1 距离 = 2×TV）。常数倍数不影响优化方向，所以代码命名"L1"但语义就是论文的 TV 损失。<code>loss.py</code> 里 <code>_compute_accept_rate_3d</code> 还顺便算了 <code>1 - 0.5 * L1</code> 作为 confidence 监督标签，与论文式 8 完全一致。
+</div>
+
+</section>
+
+<!-- ============ §7 评估 ============ -->
+<section id="sec7">
+<h2><span class="sec-num">7.</span>评估：9 个 benchmark × 4 个 target × 3 种 drafter</h2>
+<p class="lead">论文 §4.2 的主结果（Table 1）是迄今最完整的推测解码 drafter 横评之一：4 个 target 模型（Qwen3-{4B,8B,14B} + Gemma4-12B）、3 种 drafter、9 个 benchmark 跨数学/代码/聊天三个域。所有离线评估<strong>关闭 confidence 调度器</strong>，强制固定 block 长度——这样测的是"纯草稿质量"，把调度收益留给 §8 的在线评估。</p>
+
+<h3>7.1 主结果表（accepted length per round，含 bonus token）</h3>
+<table>
+<caption>表 7.1 — 论文 Table 1 节选 (Qwen3-4B target, γ=7)。完整表含 4 个 target。</caption>
+<thead><tr><th>Drafter</th><th>GSM8K</th><th>MATH500</th><th>AIME25</th><th>MBPP</th><th>HumanEval</th><th>LCB</th><th>MT-Bench</th><th>Alpaca</th><th>Arena-Hard</th></tr></thead>
+<tbody>
+<tr><td><span class="pill orange">Eagle3</span></td><td>5.14</td><td>4.62</td><td>3.92</td><td>3.69</td><td>4.16</td><td>3.77</td><td>2.39</td><td>2.26</td><td>2.55</td></tr>
+<tr><td><span class="pill blue">DFlash</span></td><td>5.40</td><td>4.85</td><td>4.15</td><td>4.40</td><td>4.74</td><td>4.18</td><td>3.07</td><td>2.96</td><td>2.83</td></tr>
+<tr><td><span class="pill purple">DSpark</span></td><td><strong>6.11</strong></td><td><strong>5.70</strong></td><td><strong>4.89</strong></td><td><strong>5.13</strong></td><td><strong>5.38</strong></td><td><strong>4.86</strong></td><td><strong>3.64</strong></td><td><strong>3.54</strong></td><td><strong>3.29</strong></td></tr>
+</tbody>
+</table>
+
+<p>跨三个 Qwen3 尺度的宏观平均提升：DSpark 相对 Eagle3 提升 <strong>30.9% / 26.7% / 30.0%</strong>，相对 DFlash 提升 <strong>16.3% / 18.4% / 18.3%</strong>。Gemma4-12B 上优势同样保持。</p>
+
+<div class="callout green">
+<span class="ctitle">为什么 DSpark 全面胜出（原理而非数字）</span>
+不是"DSpark 某个数字更高"，而是<strong>架构组合的必然结果</strong>：它同时拿到了 DFlash 的高位置 1 容量（深并行 backbone）和 Eagle3 的后段连贯性（串行 head 注入依赖）。§4.3.1 的位置条件接受率分析（论文 Figure 2）显示：DSpark 起点高（继承 DFlash 的 0.93 数学），后段不衰减（Markov head 补依赖）。两个基线各自只有一半优势——DFlash 后段衰减、Eagle3 起点低（浅网络）。<strong>优势来自补齐短板，不是单点超越。</strong>
+</div>
+
+<h3>7.2 领域效应：结构化 vs 开放式</h3>
+<p>表 7.1 揭示强领域效应：<strong>结构化任务（数学、代码）接受长度天然更高</strong>（DSpark 数学 5.57、代码 5.12），开放式聊天更低（3.49）。因为代码/数学的下一个 token 可预测性更高（语法约束强、重复模式多），而聊天高熵、多续接路径。这个领域方差正是 §5 confidence 调度的动机——固定长度验证在聊天上浪费严重，需要按域动态裁剪。</p>
+
+<h3>7.3 架构消融：深度与块长</h3>
+<p>论文 §4.3.2 两个关键消融：</p>
+
+<div class="cards">
+<div class="card">
+<span class="card-dot" style="background:var(--green)"></span>
+<h4>Drafter 深度（论文 Fig 3）</h4>
+<p>γ=7 固定，DSpark 层数 1→2→5。1→2 边际增益最大；<strong>2 层 DSpark 已超过 5 层 DFlash</strong>。说明串行 head 的参数效率远高于堆深并行层——少量自回归修正比堆参数更有效。</p>
+</div>
+<div class="card">
+<span class="card-dot" style="background:var(--accent)"></span>
+<h4>Proposal 长度（论文 Fig 4）</h4>
+<p>5 层固定，γ ∈ {4,8,12,16}。DSpark 在所有 γ 都赢 DFlash，<strong>且 γ 越大优势越宽</strong>（γ=7 时 +16%/15%/18%，γ=15 时 +30%/26%/22%）。因为 DFlash 的 suffix decay 让长块边际效用递减，DSpark 抑制衰减所以长块更值。</p>
+</div>
+</div>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig3.png" alt="DSpark Figure 3 drafter 深度消融">
+<figcaption><strong>论文 Figure 3</strong> — Drafter 深度消融（γ=7 固定，DSpark 层数 1→2→5 vs 5 层 DFlash 基线）。性能随深度单调提升，1→2 边际增益最大；<strong>2 层 DSpark 已全面超过 5 层 DFlash</strong>——串行 head 的参数效率远高于堆深并行层。</figcaption>
+</figure>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig4.png" alt="DSpark Figure 4 proposal 长度与延迟开销">
+<figcaption><strong>论文 Figure 4</strong> — Proposal 长度与延迟开销。前三面板：γ ∈ {4,8,12,16}，DSpark 在所有长度都赢 DFlash，<strong>γ 越大优势越宽</strong>（DFlash suffix decay 让长块边际效用递减，DSpark 抑制衰减）。同时对比 Markov head 与 RNN head——RNN 只在长 block 有边际增益。最右面板：γ 从 4→16，串行 head 仅增加 0.2%-1.3% 整轮延迟（target 验证在 batch=128 主导计算）。</figcaption>
+</figure>
+
+<h3>7.4 评估器实现：eval.py 的 dispatch</h3>
+<p><code>eval.py</code> 按 draft checkpoint 的 <code>architectures</code> 字段 dispatch 到对应 evaluator：</p>
+<pre><code>EVALUATORS = {
+    "Qwen3DSparkModel": Qwen3DSparkEvaluator,
+    "Gemma4DSparkModel": Gemma4DSparkEvaluator,
+    "Qwen3Eagle3Model": Qwen3Eagle3Evaluator,
+    "Gemma4Eagle3Model": Gemma4Eagle3Evaluator,
+    "Eagle3DraftModel": Qwen3Eagle3Evaluator,   # 兼容旧架构名
+}</code></pre>
+<p>注意没有 DFlash evaluator——DSpark evaluator 复用 DFlash backbone。<code>--confidence-threshold</code> 参数（默认 0.0）开启 confidence 早停：=0 时收集校准指标，&gt;0 时按阈值裁剪草稿后缀。9 个 benchmark 的 (name, sample_count) 在 <code>TASKS</code> 里硬编码，采样温度默认 1.0。</p>
+
+</section>
+
+<!-- ============ §8 生产部署 ============ -->
+<section id="sec8">
+<h2><span class="sec-num">8.</span>生产部署：DeepSeek-V4 与 Pareto 前移</h2>
+<p class="lead">论文 §5 把 DSpark 部署进 DeepSeek-V4-Flash / V4-Pro 的生产服务系统，对比旧基线 MTP-1（单 token 草稿）。这是 DSpark 区别于纯学术工作的核心——它解决的是<strong>高并发服务</strong>的系统级问题。</p>
+
+<h3>8.1 为什么旧基线是 MTP-1 而非 MTP-3/5</h3>
+<div class="callout red">
+<span class="ctitle">静态多 token 草稿在高并发下反而更慢</span>
+DeepSeek 历史上试过 MTP-3/MTP-5（静态固定 3/5 token 草稿），但在高并发生产环境里<strong>严格降低聚合吞吐</strong>——因为不管请求的接受率高低，都盲目验证 3-5 个 token，重载时这些低价值验证挤占了本可服务其他请求的 batch 容量。所以生产长期保留 MTP-1（单 token，无验证浪费）。DSpark 的 confidence 调度正是解锁大 block 的钥匙：轻载时验证长前缀、重载时自动收紧。
+</div>
+
+<h3>8.2 训练的系统优化：HAI-LLM 的两个决策</h3>
+<p>V4 的 draft backbone 是 3 层 MoE + mHC + 滑动窗口注意力 128，γ=5。训练用 HAI-LLM 框架，两个关键优化：</p>
+
+<div class="cards">
+<div class="card">
+<span class="card-dot" style="background:var(--purple)"></span>
+<h4>Hidden state 通信</h4>
+<p>跨 worker 传 target 的 full-vocab logits（V≈15 万）是带宽瓶颈。改为只传 LM head 前的 hidden states（维度 d），LM head 投影在 draft worker 本地算。<strong>通信复杂度从 O(V) 降到 O(d)</strong>。</p>
+</div>
+<div class="card">
+<span class="card-dot" style="background:var(--orange)"></span>
+<h4>Anchor-bounded packing</h4>
+<p>采样固定数量锚点，把孤立预测块打包成 dense batch，用 token 级 attention index 而非 2D padding mask。维持精确因果 mask 的同时避免 padding 开销，把 draft 计算与 target context 长度解耦。</p>
+</div>
+</div>
+
+<h3>8.3 调度器的生产适配：异步 + ZOS</h3>
+<p>论文 §5.2 坦言 Algorithm 1 的理论形式有两个生产冲突：</p>
+<ol>
+<li><strong>SPS 曲线是离散锯齿的</strong>，不是平滑单峰——早停可能困在局部最优。</li>
+<li><strong>ZOS（Zero-Overhead Scheduling）要求下一步 batch size 在当前步完成前就确定</strong>，而同步调度会让 GPU 流水线停顿。</li>
+</ol>
+
+<div class="callout purple">
+<span class="ctitle">异步调度：用两步前的预测做截断</span>
+解法是<strong>异步</strong>：候选 token 仍按当前最新的累积 confidence 严格排序，但<strong>动态截断长度（batch 容量上限）用两步前的 confidence 预测</strong>来定。这把调度变成"动态 top-ℓ 选择"。两步前的历史预测引入轻微时间偏移，但选择机制<strong>保序</strong>——最自信的草稿 token 永远优先验证。<br><br>
+更妙的副作用：去掉早停做全局搜索本会泄露未来 token（违反无损性），但因为截断只依赖两步前的信息，<strong>admit 决策被时间隔离于当前 token 的实例化</strong>——异步设计天然形成因果屏障，既跨越硬件 SPS 悬崖又保住精确 target 分布恢复。
+</div>
+
+<h3>8.4 变长验证的内核改造</h3>
+<p>动态调度产出<strong>变长验证前缀</strong>，而标准 decode kernel 优化的是定长 query。DSpark 把物理执行与逻辑序列追踪解耦：所有 token 跨请求<strong>扁平化</strong>成独立元素统一处理，序列内依赖通过稀疏 attention 里的 marker tensor 传递。在 V4 架构上，只需改 index-attention 和 compress 两个 kernel 就支持变长路由，零额外开销。</p>
+
+<h3>8.5 在线结果：Pareto 前移</h3>
+<p>论文 §5.4 + Figure 7-8 的核心结论：</p>
+
+<table>
+<caption>表 8.1 — DSpark vs MTP-1 在 DeepSeek-V4 生产流量下（论文 §5.4）</caption>
+<thead><tr><th>引擎</th><th>SLA 锚点</th><th>聚合吞吐提升</th><th>同吞吐下 per-user 加速</th></tr></thead>
+<tbody>
+<tr><td>V4-Flash</td><td>80 tok/s/user</td><td>+51%</td><td rowspan="2">+60% ~ +85%</td></tr>
+<tr><td>V4-Flash</td><td>120 tok/s/user (严苛)</td><td>+661% (基线接近边界)</td></tr>
+<tr><td>V4-Pro</td><td>35 tok/s/user</td><td>+52%</td><td rowspan="2">+57% ~ +78%</td></tr>
+<tr><td>V4-Pro</td><td>50 tok/s/user (严苛)</td><td>+406% (基线接近边界)</td></tr>
+</tbody>
+</table>
+
+<div class="callout green">
+<span class="ctitle">真正重要的不是那个 661%</span>
+严苛 SLA 下的"+661%"是数值噱头——基线在那里已退化为极小并发。真正有意义的是：<strong>DSpark 在基线无法高效支撑的严苛交互性约束下仍维持非退化吞吐</strong>。它把服务系统的 Pareto 前沿（吞吐 × 交互性）向外推——中等 SLA 下提升 51%-52% 吞吐，严苛 SLA 下<strong>解锁了此前不可达的性能档位</strong>。Figure 8 进一步揭示机制：轻载时调度器分配 4-6 token 验证预算，重载时自动收紧到 2 左右——负载自适应。
+</div>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig7.png" alt="DSpark Figure 7 Pareto 前移">
+<figcaption><strong>论文 Figure 7</strong> — 吞吐 vs. 每用户生成速度（DeepSeek-V4-Flash / V4-Pro，真实用户流量）。散点=原始遥测，实线=拟合前沿。DSpark 把 Pareto 前沿向外推：中等 SLA（V4-Flash 80 tok/s/user、V4-Pro 35 tok/s/user）下吞吐 +51%/+52%；严苛 SLA（120/50 tok/s/user）下基线退化、DSpark 仍维持非退化吞吐——解锁此前不可达的交互性档位。</figcaption>
+</figure>
+
+<figure class="paper-fig">
+<img src="assets/figures/fig8.png" alt="DSpark Figure 8 负载自适应">
+<figcaption><strong>论文 Figure 8</strong> — 负载自适应吞吐与验证预算。上排（a,b）：不同并发度下的聚合吞吐；下排（c,d）：每请求平均验证预算。机制清晰：<strong>轻载</strong>（&lt;200/150 并发）调度器分配 4-6 token 验证预算，用闲置算力换更多接受 token；<strong>重载</strong>时自动收紧到约 2 token，避免低置信后缀挤占 batch 容量。这就是 DSpark 在高并发下不退化的根因。</figcaption>
+</figure>
+
+<h3>8.6 局限</h3>
+<p>论文坦言：prefix scheduler 只省了 target 验证浪费，但<strong>draft 侧的固定成本</strong>（并行 backbone 必须先跑完整块）无法回收。对接受率天然极低的复杂查询，这块起草算力是沉没的。未来方向是 difficulty-aware early exit——让 draft model 对"难"请求提前退出全块生成。</p>
+
+</section>
+
+<!-- ============ §9 源码工程补充 ============ -->
+<section id="sec9">
+<h2><span class="sec-num">9.</span>Superpowers 源码补充：把遗漏的工程层补齐</h2>
+<p class="lead">前 8 节偏论文机制与系统结果，这一节补源码里更"落地"的部分：Superpowers 任务账本证明报告动画如何被构建和验证；随后把 HTML 原先略过的 cache 协议、数据解析、训练运行时、评估拒绝采样、baseline 配置和 confidence 诊断串起来。</p>
+
+<h3>9.1 Superpowers 任务账本：报告怎么被验证</h3>
+<table>
+<thead><tr><th>任务</th><th>产物</th><th>验证重点</th></tr></thead>
+<tbody>
+<tr><td>Task 1</td><td><code>assets/anim-engine.js</code> + CSS</td><td>从 Flash Attention 项目升级出可复用 <code>AnimEngine</code>；新增 <code>highlightRow</code> / <code>rollNumber</code> / <code>branchArrow</code>；用语法检查和 DOM shim 覆盖首屏 draw、注册器、IntersectionObserver 初始化。</td></tr>
+<tr><td>Task 2</td><td><code>decode-cycle.js</code></td><td>替换 §3.1 Mermaid；Chrome CDP 检查 SVG、marker、控件、step 切换；视觉截图确认 EFGH 与置信度标签渲染。</td></tr>
+<tr><td>Task 3</td><td><code>two-stage-gen.js</code></td><td>补 §3.3 的两段式生成动画；结构测试确认 6 步均可渲染，并记录 viewBox 修复风险。</td></tr>
+<tr><td>Task 4</td><td><code>scheduler-greedy.js</code></td><td>替换 §5.4 Mermaid；修复 brief 里 8 处 JS 语法 typo；确认 3 个新增动画原语都被调度器场景实际使用。</td></tr>
+<tr><td>Task 5</td><td>端到端验收</td><td>检查 3 个动画、1 个保留 Mermaid、8 张论文原图和脚本加载顺序；保证动画增强没有破坏论文图和原页面结构。</td></tr>
+</tbody>
+</table>
+
+<div class="callout green">
+<span class="ctitle">Superpowers 在这里的角色</span>
+它不是 DSpark 算法的一部分，而是报告生产流程的一部分：每个动画都有任务、验证、截图或 DOM 检查记录。后续继续补源码工程层时，也应该沿用这个方式——小任务、可验证、最后整体回归。
+</div>
+
+<h3>9.2 Target cache：源码里的 38TB 不是一句话</h3>
+<p>正文 §6.5 解释了为什么需要 target cache，但源码里更关键的是<strong>这份超大缓存怎么能被稳定写入和训练读取</strong>。核心协议集中在 <code>deepspec/data/target_cache_dataset.py</code>：</p>
+
+<table>
+<thead><tr><th>源码对象</th><th>作用</th><th>为什么重要</th></tr></thead>
+<tbody>
+<tr><td><code>TARGET_CACHE_VERSION = 2</code></td><td>固定 manifest 协议版本、dtype、index record size。</td><td>训练进程先校验协议，避免用错旧缓存或错 dtype 缓存。</td></tr>
+<tr><td><code>samples.idx</code></td><td>每条样本一个定长二进制索引，记录 shard id、seq_len 和各 tensor offset。</td><td>不用扫描 38TB 数据文件；按样本 id O(1) 定位。</td></tr>
+<tr><td><code>shard-xxxxx.bin</code></td><td>顺序写入 <code>input_ids</code>、<code>loss_mask</code>、多层 hidden states、last hidden states。</td><td>大文件顺序写更稳，读取时可 mmap；hidden 用 bfloat16 降低体积。</td></tr>
+<tr><td><code>AsyncTargetCacheWriter</code></td><td>把 CUDA tensor 转成 CPU bytes 后放进后台写线程。</td><td>避免训练/预处理主循环被磁盘写阻塞，也避免队列持有 CUDA tensor。</td></tr>
+<tr><td><code>CacheDataset</code></td><td>mmap index 和 shard；最多保留若干打开 shard，超出后 LRU 关闭。</td><td>训练读取 cache 时不把巨大文件加载进内存，且控制文件句柄数量。</td></tr>
+</tbody>
+</table>
+
+<div class="callout yellow">
+<span class="ctitle">容易误解的一点</span>
+README 里的 38TB 是存储量级提醒；源码里的真正工程点是 cache protocol：manifest 做契约，index 做随机访问，shard 做顺序 I/O，mmap 做低内存读取，collator 再把变长样本 pad 成 batch。
+</div>
+
+<h3>9.3 数据解析：chat template 与 loss mask</h3>
+<p>训练数据不是简单 tokenizer 一遍。<code>deepspec/data/parser.py</code> 先按模型族注册 chat template，再把 assistant span 标成 loss 区域：</p>
+
+<table>
+<thead><tr><th>模型族</th><th>模板差异</th><th>loss mask 语义</th></tr></thead>
+<tbody>
+<tr><td>Qwen</td><td><code>&lt;|im_start|&gt;user</code> / <code>&lt;|im_start|&gt;assistant</code>，默认 system prompt 是 helpful assistant。</td><td>只对 assistant 回复 token 置 1，user/system 不参与 draft loss。</td></tr>
+<tr><td>Gemma4</td><td><code>&lt;|turn&gt;user</code> / <code>&lt;|turn&gt;model</code>，并插入 <code>&lt;|channel&gt;thought</code> 前缀。</td><td>如果有 thinking 前缀，loss 从前缀之后开始，避免把格式引导 token 当内容学习目标。</td></tr>
+</tbody>
+</table>
+
+<p>这解释了为什么 cache 里除了 <code>input_ids</code> 还必须有 <code>loss_mask</code>：DSpark 训练时要从长序列随机采 anchor，但只有 assistant 区域才应该贡献预测块。</p>
+
+<h3>9.4 训练运行时：FSDP、BF16 master optimizer、自动恢复</h3>
+<p><code>BaseTrainer</code> 的职责远超"for batch in dataloader"。它把分布式、恢复、预取、精度和 checkpoint 全包起来：</p>
+
+<table>
+<thead><tr><th>模块</th><th>源码行为</th><th>工程意义</th></tr></thead>
+<tbody>
+<tr><td>分布式初始化</td><td><code>init_dist(local_rank)</code> 解析 rank/world size，随后用 FSDP 包 draft model。</td><td>脚本层只需设置 node rank；<code>train.py</code> 自己按可见 GPU spawn worker。</td></tr>
+<tr><td>训练 schedule</td><td>从 dataset size、global batch、local batch 推出 gradient accumulation、steps per epoch、max steps。</td><td>避免多卡/少卡时手工改步数，resume 也能按 micro step 对齐。</td></tr>
+<tr><td><code>BF16Optimizer</code></td><td>模型参数 bf16 训练，但维护 fp32 master params；AdamW 更新 master，再 copy 回模型。</td><td>保留 bf16 显存优势，同时降低优化器数值漂移风险。</td></tr>
+<tr><td>自动恢复</td><td><code>step_latest</code> 指向最新 checkpoint；每 rank 保存 optimizer、RNG、world size、local batch、<code>next_micro_step</code>。</td><td>断点恢复不是只加载权重，而是恢复可复现训练状态。</td></tr>
+<tr><td>HFAI suspend</td><td><code>SuspendController</code> 监听挂起请求，先保存 checkpoint 再 suspend。</td><td>面向集群抢占/暂停场景，避免长训练被中断后丢进度。</td></tr>
+</tbody>
+</table>
+
+<div class="callout purple">
+<span class="ctitle">DFlash 的训练实现很"源码味"</span>
+DFlash 没有单独 trainer。<code>config/dflash/*.py</code> 仍然用 <code>Qwen3DSparkTrainer</code>，但把 <code>markov_rank=0</code>、<code>confidence_head_alpha=0.0</code>、<code>l1_loss_alpha=0.0</code>，于是 DSpark 退化成 CE-only 的并行 backbone baseline。
+</div>
+
+<h3>9.5 评估循环：精确拒绝采样与指标</h3>
+<p>评估不只是生成文本然后算速度。<code>deepspec/eval/base_evaluator.py</code> 实现了 lossless speculative decoding 的核心拒绝采样：</p>
+
+<table>
+<thead><tr><th>步骤</th><th>源码动作</th><th>对应指标</th></tr></thead>
+<tbody>
+<tr><td>prefill</td><td>target 先跑 prompt，采第一个真实 token，并初始化 target KV cache。</td><td>每轮 proposal 都从已接受前缀继续，保证和 target 采样过程一致。</td></tr>
+<tr><td>propose</td><td>DSpark 或 Eagle3 生成候选 tokens 和每个候选的 draft 概率。</td><td><code>proposal_lengths</code> 记录实际验证长度；confidence threshold 可裁短 DSpark 后缀。</td></tr>
+<tr><td>verify</td><td>target 对 anchor + draft tokens 做一次前向；对每个候选计算 <code>min(1, p_target / p_draft)</code> 接受。</td><td><code>accepted_draft_lengths</code> 和 <code>accept_rates_by_position</code> 来自连续前缀接受情况。</td></tr>
+<tr><td>reject</td><td>若第 k 个 token 被拒，用 <code>sample_residual(target_probs, draft_probs)</code> 从残差分布采补偿 token。</td><td>这是保证 lossless 的关键：拒绝后不是直接采 target，而是采 residual。</td></tr>
+<tr><td>report</td><td>跨 rank all-reduce 后输出 <code>acceptance_length</code>、<code>verify_rate</code>、<code>accept_rate@pos</code>。</td><td>HTML 表里的 accepted length 背后就是这些 counters。</td></tr>
+</tbody>
+</table>
+
+<h3>9.6 Baseline 与诊断：Eagle3 约束、confidence artifacts</h3>
+<div class="cards">
+  <div class="card">
+    <span class="pill orange">Eagle3</span>
+    <h4>单层 draft cache 约束</h4>
+    <p>配置里 <code>ttt_length=7</code>、<code>draft_num_hidden_layers=1</code>；评估器也断言 hidden layers 必须为 1，因为它会无 causal mask 扩展 draft cache，只有单层时这个缓存语义才安全。</p>
+  </div>
+  <div class="card">
+    <span class="pill blue">DSpark eval</span>
+    <h4>confidence threshold 的双重语义</h4>
+    <p><code>--confidence-threshold &gt; 0</code> 时按阈值裁掉低置信后缀；等于 0 时不裁剪，反而启用 confidence calibration 诊断收集。</p>
+  </div>
+  <div class="card">
+    <span class="pill green">diagnostics</span>
+    <h4>诊断产物落盘</h4>
+    <p><code>ConfidenceHeadRecorder</code> 统计 per-position ECE、AUROC、Brier，并写 <code>metrics.json</code> 与 <code>reliability_diagram.png</code>，还可写 TensorBoard。</p>
+  </div>
+  <div class="card">
+    <span class="pill purple">guardrail</span>
+    <h4>target layer 防坑</h4>
+    <p>评估器会禁止 <code>target_layer_ids</code> 包含最终 decoder layer，因为 Transformers 的 final hidden 与 target cache 生成时捕获的 raw decoder outputs 语义不同。</p>
+  </div>
+</div>
+
+<div class="callout yellow">
+<span class="ctitle">这次整理后的阅读路线</span>
+如果读论文机制，按 §2-§5 走；如果准备跑代码，先读 §6 的训练目标，再读本节的 cache / parser / trainer / evaluator；如果要继续改这份报告，用 §9.1 的 Superpowers 账本作为质量门槛。
+</div>
+
+</section>
+
+<!-- ============ 总结 ============ -->
+<section id="summary">
+<h2><span class="sec-num">★</span>核心要点回顾</h2>
+<div class="summary-cards">
+<div class="summary-card green">
+<span class="sc-dot">🎯</span>
+<h4>半自回归 = 并行快 + 串行准</h4>
+<p>重计算交给并行 backbone（保持 t_draft≈O(1)），只追加轻量串行 head 注入 intra-block 依赖（抑 suffix decay）。两段加和 = 鱼和熊掌。</p>
+</div>
+<div class="summary-card">
+<span class="sc-dot">🔗</span>
+<h4>Markov head 默认够用</h4>
+<p>一阶马尔可夫 + 低秩分解 (r=256) 已打破多模态碰撞。RNN head 只在 γ≥15 有边际增益，实现复杂度更高故不默认。</p>
+</div>
+<div class="summary-card purple">
+<span class="sc-dot">📊</span>
+<h4>TV 损失 = 接受率直接代理</h4>
+<p>权重 0.9 的 L_tv 直接最小化 draft-target 分布的 TV 距离，而接受概率 = 1-½TV。比 CE (权重 0.1) 更对齐验证目标。</p>
+</div>
+<div class="summary-card orange">
+<span class="sc-dot">⚙️</span>
+<h4>Confidence 调度解锁大 block</h4>
+<p>静态多 token 在高并发反而降吞吐。confidence head + STS 校准 + 异步 ZOS 调度 = 按负载动态裁剪，轻载长验证、重载自动收紧。</p>
+</div>
+<div class="summary-card green">
+<span class="sc-dot">🏗️</span>
+<h4>Target cache 是离线化关键</h4>
+<p>预计算 target 完整分布存 38TB 缓存，训练不再需 target 在线。HAI-LLM 进一步只传 hidden states（O(V)→O(d)）+ anchor-bounded packing。</p>
+</div>
+<div class="summary-card">
+<span class="sc-dot">🚀</span>
+<h4>Pareto 前移而非单点加速</h4>
+<p>V4 生产：同吞吐 +60-85% per-user 速度，更重要的是在严苛 SLA 下维持非退化吞吐，解锁此前不可达的交互性档位。</p>
+</div>
+</div>
+
+<div class="callout yellow" style="margin-top:32px">
+<span class="ctitle">一句话总结 DSpark</span>
+<strong>"用最小的串行修正补上并行的依赖缺失，用校准过的置信度把验证算力投到期望回报最高的地方。"</strong>——前者解决"草稿质量"，后者解决"系统效率"，两者合起来才让大 block 草稿在生产环境里真正可用。
+</div>
+
+</section>
+
+</main>
+
+<footer>
+DeepSpec / DSpark 深度讲解 · 基于 <a href="https://github.com/deepseek-ai/DeepSpec">deepseek-ai/DeepSpec</a> 仓库与本地 DSpark 论文 (<code>DSpark_paper.pdf</code>) · 由 Hermes Agent 生成
+</footer>
+
+<script src="assets/deepspec.js"></script>
+<script src="assets/anim-engine.js"></script>
+<script src="assets/anims/decode-cycle.js"></script>
+<script src="assets/anims/dflash-kv-injection.js"></script>
+<script src="assets/anims/dspark-anchor-logit.js"></script>
+<script src="assets/anims/two-stage-gen.js"></script>
+<script src="assets/anims/markov-low-rank.js"></script>
+<script src="assets/anims/scheduler-greedy.js"></script>
+</body>
+</html>

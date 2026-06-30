@@ -2,7 +2,7 @@
 title: DFlash 原理与 vLLM 适配实现
 description: 从扩散模型到投机解码——DFlash 原理解析与 vLLM 代码落地
 authors: [Inharay]
-date: 2026-06-30 12:00:00 +0800
+date: 2026-06-30 08:00:00 +0800
 categories: [AI, Speculative Decoding]
 tags: [DFlash, vLLM, 扩散模型, 投机解码]
 pin: false

@@ -10,17 +10,17 @@ math: false
 mermaid: false
 ---
 
-<link rel="stylesheet" href="/deepspec/assets/deepspec.css">
+<link rel="stylesheet" href="/projects/deepspec/assets/deepspec.css">
 
-> 📄 **完整版报告**（含交互式 SVG 动画）：[https://inharay.github.io/deepspec](https://inharay.github.io/deepspec)
+> 📄 **完整版报告**（含交互式 SVG 动画）：[https://inharay.github.io/projects/deepspec](https://inharay.github.io/projects/deepspec)
 >
 > 下方为内嵌预览，建议直接访问完整版以获得最佳阅读体验。
 
 <div style="position: relative; width: 100%; min-height: 80vh; border: 1px solid #d0d7de; border-radius: 12px; overflow: hidden; background: #fff;">
-  <iframe src="/deepspec/index.html" style="width: 100%; min-height: 80vh; border: 0; display: block;" loading="lazy" title="DeepSpec 技术分析报告"></iframe>
+  <iframe src="/projects/deepspec/index.html" style="width: 100%; min-height: 80vh; border: 0; display: block;" loading="lazy" title="DeepSpec 技术分析报告"></iframe>
 </div>
 
 <noscript>
 此报告包含交互式 SVG 动画，需要浏览器启用 JavaScript 才能完整渲染。
-请直接访问 <a href="/deepspec/">https://inharay.github.io/deepspec</a> 查看完整报告。
+请直接访问 <a href="/projects/deepspec/">https://inharay.github.io/projects/deepspec</a> 查看完整报告。
 </noscript>

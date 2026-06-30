@@ -8,4 +8,4 @@ order: 4
 
 ## 专题报告
 
-- [DeepSpec 技术分析报告](/deepspec/) — 含交互式 SVG 动画
+- [DeepSpec 技术分析报告](/projects/deepspec/) — 含交互式 SVG 动画

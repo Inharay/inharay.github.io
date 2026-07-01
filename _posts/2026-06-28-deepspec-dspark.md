@@ -1,7 +1,7 @@
 ---
 title: DeepSpec 与 DSpark 深度讲解
 description: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation — 含交互式 SVG 动画
-authors: [Inharay]
+authors: [yuancao]
 date: 2026-06-28 08:00:00 +0800
 categories: [AI, Speculative Decoding]
 tags: [DeepSpec, DSpark, DFlash, 推测解码]

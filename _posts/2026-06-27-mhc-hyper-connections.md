@@ -1,7 +1,7 @@
 ---
 title: mHC 流形约束超连接论文详解
 description: Manifold-Constrained Hyper-Connections — 含交互式动画的论文深度解读
-authors: [Inharay]
+authors: [yuancao]
 date: 2026-06-27 08:00:00 +0800
 categories: [AI, Model Architecture]
 tags: [mHC, Hyper-Connections, 流形约束, 论文详解]
